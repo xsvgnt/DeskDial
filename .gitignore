@@ -1,0 +1,15 @@
+# .NET build output
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+
+# IDE / OS
+.vs/
+.vscode/
+Thumbs.db
+desktop.ini
+
+# Arduino build output
+build/

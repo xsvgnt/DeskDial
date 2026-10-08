@@ -1,0 +1,76 @@
+
+
+
+
+
+
+
+Started logging.
+18:48:46.958081 Language server launched with arguments:
+18:48:46.958081   arg[0] = c:\Users\xavie\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-language-server.exe
+18:48:46.958081   arg[1] = -clangd
+18:48:46.958081   arg[2] = c:\Users\xavie\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\clangd.exe
+18:48:46.958081   arg[3] = -cli-daemon-addr
+18:48:46.958081   arg[4] = localhost:57092
+18:48:46.958081   arg[5] = -cli-daemon-instance
+18:48:46.958081   arg[6] = 1
+18:48:46.958081   arg[7] = -fqbn
+18:48:46.958081   arg[8] = esp32:esp32:esp32_family
+18:48:46.958081   arg[9] = -skip-libraries-discovery-on-rebuild
+18:48:46.958081   arg[10] = -board-name
+18:48:46.958081   arg[11] = ESP32 Family Device
+18:48:46.958081   arg[12] = -no-real-time-diagnostics
+18:48:46.958081   arg[13] = -log
+18:48:46.958081   arg[14] = -logpath
+18:48:46.958081   arg[15] = c:\Users\xavie\OneDrive\JC3636W518EN\esp32-media-remote\firmware\NowPlaying
+18:48:46.958596 logging to c:\Users\xavie\OneDrive\JC3636W518EN\esp32-media-remote\firmware\NowPlaying\inols.log
+18:48:46.960164 [97mLS: : Initial board configuration: esp32:esp32:esp32_family[0m
+18:48:46.960164 [97mLS: : arduino-language-server.exe Version: 0.0.0-git Commit:  Date: [0m
+18:48:46.960164 [97mLS: : Language server temp directory: C:\Users\xavie\AppData\Local\Temp\arduino-language-server1076558533[0m
+18:48:46.960164 [97mLS: : Language server build path: C:\Users\xavie\AppData\Local\Temp\arduino-language-server1076558533\build[0m
+18:48:46.960164 [97mLS: : Language server build sketch root: C:\Users\xavie\AppData\Local\Temp\arduino-language-server1076558533\build\sketch[0m
+18:48:46.960164 [97mLS: : Language server FULL build path: C:\Users\xavie\AppData\Local\Temp\arduino-language-server1076558533\fullbuild[0m
+18:48:46.960682 IN Elapsed: 518.1µs
+18:48:46.960682 [92mIDE --> LS REQU initialize 0[0m
+18:48:46.961207 [92m                initialize 0: [93mwrite-locked[0m[0m
+18:48:46.962243 [92m                initialize 0: [93mwrite-unlocked[0m[0m
+18:48:46.962243 [96mINIT --- : initializing workbench: file:///c%3A/Users/xavie/OneDrive/JC3636W518EN/esp32-media-remote/firmware/NowPlaying[0m
+18:48:46.962243 [96mINIT --- : [93mread-locked[0m[0m
+18:48:46.962243 [96mINIT --- : [93mread-unlocked[0m[0m
+18:48:46.962762 [92m                initialize 0: initialization parameters: {"capabilities":{"textDocumentSync":{"openClose":true,"change":2,"save":{"includeText":true}},"completionProvider":{"triggerCharacters":[".","\u003c","\u003e",":","\"","/"],"allCommitCharacters":[" ","\t","(",")","[","]","{","}","\u003c","\u003e",":",";",",","+","-","/","*","%","^","\u0026","#","?",".","=","\"","'","|"],"completionItem":{}},"hoverProvider":{},"signatureHelpProvider":{"triggerCharacters":["(",","]},"definitionProvider":{},"documentHighlightProvider":{},"documentSymbolProvider":{},"codeActionProvider":{"codeActionKinds":["quickfix","refactor","info"]},"documentFormattingProvider":{},"documentRangeFormattingProvider":{},"documentOnTypeFormattingProvider":{"firstTriggerCharacter":"\n"},"renameProvider":{},"executeCommandProvider":{"commands":["clangd.applyFix","clangd.applyTweak"]},"workspaceSymbolProvider":{}},"serverInfo":{"name":"arduino-language-server","version":"0.0.0-git"}}[0m
+18:48:46.962762 [32mIDE <-- LS RESP initialize 0[0m
+18:48:46.962762 OUT Elapsed: 0s
+18:48:46.967060 listen tcp 127.0.0.1:6060: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+18:48:46.968157 [96mINIT --- : Running build with: {
+  "instance": {
+    "id": 1
+  },
+  "fqbn": "esp32:esp32:esp32_family",
+  "sketch_path": "C:\\Users\\xavie\\OneDrive\\JC3636W518EN\\esp32-media-remote\\firmware\\NowPlaying",
+  "build_path": "C:\\Users\\xavie\\AppData\\Local\\Temp\\arduino-language-server1076558533\\fullbuild",
+  "verbose": true,
+  "create_compilation_database_only": true
+}[0m
+18:48:46.970578 IN Elapsed: 7.8161ms
+18:48:46.970578 [92mIDE --> LS NOTIF initialized[0m
+18:48:46.970578 [92m                 initialized: Notification is not propagated to clangd[0m
+18:48:46.970578 IN Elapsed: 0s
+18:48:46.970578 [92mIDE --> LS NOTIF textDocument/didOpen[0m
+18:48:46.970977 [92m                 textDocument/didOpen: [93mwrite-locked[0m[0m
+18:48:46.970977 [92m                 textDocument/didOpen: (throttled: waiting for clangd)[0m
+18:48:46.970977 [92m                 textDocument/didOpen: [93munlocked (waiting clangd)[0m[0m
+18:48:47.926916 [96mINIT --- : build stdout:[0m
+18:48:47.926916 [96mINIT --- : FQBN: esp32:esp32:esp32_family
+Using board 'esp32_family' from platform in folder: C:\Users\xavie\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.5
+Using core 'arduino' from platform in folder: C:\Users\xavie\AppData\Local\Arduino15\packages\esp32\hardware\esp32\3.3.5
+
+cmd /c if exist "C:\\Users\\xavie\\OneDrive\\JC3636W518EN\\esp32-media-remote\\firmware\\NowPlaying\\partitions.csv" COPY /y "C:\\Users\\xavie\\OneDrive\\JC3636W518EN\\esp32-media-remote\\firmware\\NowPlaying\\partitions.csv" "C:\\Users\\xavie\\AppData\\Local\\Temp\\arduino-language-server1076558533\\fullbuild\\partitions.csv"
+cmd /c if not exist "C:\\Users\\xavie\\AppData\\Local\\Temp\\arduino-language-server1076558533\\fullbuild\\partitions.csv" if exist "\\partitions.csv" COPY "\\partitions.csv" "C:\\Users\\xavie\\AppData\\Local\\Temp\\arduino-language-server1076558533\\fullbuild\\partitions.csv"
+cmd /c if not exist "C:\\Users\\xavie\\AppData\\Local\\Temp\\arduino-language-server1076558533\\fullbuild\\partitions.csv" COPY "C:\\Users\\xavie\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.5\\tools\\partitions\\{build.partitions}.csv" "C:\\Users\\xavie\\AppData\\Local\\Temp\\arduino-language-server1076558533\\fullbuild\\partitions.csv"
+The system cannot find the file specified.
+[0m
+18:48:47.926916 [96mINIT --- : build stderr:[0m
+18:48:47.926916 [96mINIT --- : [0m
+18:48:47.927451 [96mINIT --- : error starting clang: error running compile: rpc error: code = Internal desc = exit status 1[0m
+18:48:47.927451 [92m                 textDocument/didOpen: [93mlocked (waiting clangd)[0m[0m
+18:48:47.927451 [92m                 textDocument/didOpen: clangd startup failed: quitting Language server[0m
