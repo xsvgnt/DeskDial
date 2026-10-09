@@ -10,6 +10,8 @@
 
 #include <Arduino.h>
 #include <esp_heap_caps.h>
+#include <Preferences.h>
+#include "soc/usb_serial_jtag_reg.h"
 #include "scr_st77916.h" // vendor driver: panel, touch, backlight, LVGL glue
 #include "protocol.h"
 
@@ -29,7 +31,12 @@ static const uint32_t PAUSED_IDLE_MS = 120000;    // paused -> "Nothing is playi
 static const uint32_t DIM_AFTER_MS = 10000;
 static const uint32_t TAP_FEEDBACK_MS = 700;
 static const uint32_t OPTIMISTIC_HOLD_MS = 1500;  // ignore stale "playing" from PC
-static const uint8_t BRIGHT_FULL = 100;
+static const uint32_t SETTINGS_HOLD_MS = 5000;    // long press on the artwork
+static const uint32_t PC_OFF_AFTER_MS = 2000;     // no USB heartbeat -> PC off/asleep
+static const uint32_t PC_OFF_PEEK_MS = 5000;      // "PC is off" shown after a touch
+static const uint32_t PC_OFF_POLL_MS = 100;       // loop period while dark
+#define PC_OFF_CPU_MHZ 80                         // CPU clock while dark (0 = leave as is)
+static const uint8_t BRIGHT_DEFAULT = 100;
 static const uint8_t BRIGHT_DIM = 10;
 
 static const uint32_t COL_GREEN = 0x1DB954;
@@ -67,6 +74,17 @@ static lv_obj_t *arc, *art_box, *art_img, *art_placeholder, *tap_disc, *tap_icon
 static lv_obj_t *lbl_title, *lbl_artist, *lbl_time, *lbl_idle, *btn_prev, *btn_next;
 static bool ui_idle = false, ui_first = true, dimmed = false;
 static uint32_t idle_since = 0, tap_until = 0;
+static bool art_long_fired = false; // swallow the click that ends a long press
+
+// Brightness setting, persisted in NVS
+static Preferences prefs;
+static uint8_t bright_full = BRIGHT_DEFAULT;
+static lv_obj_t *dlg_backdrop = nullptr, *dlg_slider, *dlg_value;
+
+// PC presence
+static lv_obj_t *scr_main, *scr_off;
+static bool pc_off = false;
+static uint32_t last_sof_ms = 0, last_frame = 0xFFFFFFFF, peek_until = 0;
 static int32_t shown_sec = -1, shown_dur_sec = -1;
 static int16_t shown_arc = -1;
 
@@ -256,9 +274,22 @@ static void serial_poll()
 }
 
 // ==================================================================== UI ==
+static void show(lv_obj_t *o, bool visible)
+{
+  if (visible)
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+  else
+    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void on_art_clicked(lv_event_t *e)
 {
-  if (ui_idle)
+  if (art_long_fired)
+  {
+    art_long_fired = false;
+    return;
+  }
+  if (ui_idle || dlg_backdrop)
     return;
   uint32_t t = millis();
   send_cmd(CMD_PLAY_PAUSE);
@@ -270,6 +301,11 @@ static void on_art_clicked(lv_event_t *e)
   lv_label_set_text(tap_icon, now.playing ? ICON_PLAY : ICON_PAUSE); // state moved *to*
   lv_obj_clear_flag(tap_disc, LV_OBJ_FLAG_HIDDEN);
   tap_until = t + TAP_FEEDBACK_MS; // expiry handled by ui_tick
+}
+
+static void on_art_pressed(lv_event_t *e)
+{
+  art_long_fired = false; // a new touch starts clean, even if a release was lost
 }
 
 static void on_nav_clicked(lv_event_t *e)
@@ -299,6 +335,138 @@ static lv_obj_t *make_nav(lv_obj_t *parent, const char *sym, lv_coord_t x, uint8
   return b;
 }
 
+// ------------------------------------------------------ brightness dialog --
+static uint8_t clamp_brightness(int v)
+{
+  v = (v + 5) / 10 * 10; // snap to the 10 % grid
+  return (uint8_t)(v < 10 ? 10 : (v > 100 ? 100 : v));
+}
+
+static void load_brightness()
+{
+  prefs.begin("npr", true); // read-only
+  bright_full = clamp_brightness(prefs.getUChar("bright", BRIGHT_DEFAULT));
+  prefs.end();
+}
+
+static void save_brightness(uint8_t v)
+{
+  prefs.begin("npr", false);
+  prefs.putUChar("bright", v);
+  prefs.end();
+}
+
+static void dlg_show_value(int pct)
+{
+  lv_label_set_text_fmt(dlg_value, "%d %%", pct);
+}
+
+static void dlg_close(bool save)
+{
+  if (!dlg_backdrop)
+    return;
+  int pct = lv_slider_get_value(dlg_slider) * 10;
+  if (save && pct != bright_full)
+  {
+    bright_full = (uint8_t)pct;
+    save_brightness(bright_full);
+  }
+  lv_obj_del_async(dlg_backdrop); // we're inside a child's event: delete after it
+  dlg_backdrop = nullptr;
+  set_brightness(bright_full); // Cancel: back to the saved value
+  dimmed = false;
+}
+
+static void on_dlg_slider(lv_event_t *e)
+{
+  int pct = lv_slider_get_value(dlg_slider) * 10;
+  dlg_show_value(pct);
+  set_brightness(pct); // live preview
+}
+
+static void on_dlg_button(lv_event_t *e)
+{
+  dlg_close((bool)(uintptr_t)lv_event_get_user_data(e));
+}
+
+static lv_obj_t *make_dlg_button(lv_obj_t *parent, const char *text, bool primary, lv_coord_t x)
+{
+  lv_obj_t *b = lv_btn_create(parent);
+  lv_obj_set_size(b, 100, 44);
+  lv_obj_align(b, LV_ALIGN_BOTTOM_MID, x, -14);
+  lv_obj_set_style_radius(b, 22, 0);
+  lv_obj_set_style_shadow_width(b, 0, 0);
+  lv_obj_set_style_bg_color(b, lv_color_hex(primary ? COL_GREEN : 0x3A3A3A), 0);
+  lv_obj_add_event_cb(b, on_dlg_button, LV_EVENT_CLICKED, (void *)(uintptr_t)primary);
+  lv_obj_t *l = lv_label_create(b);
+  lv_obj_set_style_text_font(l, &font_latin_16, 0);
+  lv_obj_set_style_text_color(l, primary ? lv_color_black() : lv_color_white(), 0);
+  lv_label_set_text(l, text);
+  lv_obj_center(l);
+  return b;
+}
+
+static void dlg_open()
+{
+  if (dlg_backdrop)
+    return;
+  show(tap_disc, false);
+  tap_until = 0;
+
+  // Full-screen backdrop on the top layer: dims the UI and swallows touches.
+  // Translucency through bg_opa only (never animated opa on parents).
+  dlg_backdrop = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(dlg_backdrop);
+  lv_obj_set_size(dlg_backdrop, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_bg_color(dlg_backdrop, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(dlg_backdrop, LV_OPA_70, 0);
+  lv_obj_add_flag(dlg_backdrop, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(dlg_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Panel fits inside the 254 px safe square
+  lv_obj_t *panel = lv_obj_create(dlg_backdrop);
+  lv_obj_remove_style_all(panel);
+  lv_obj_set_size(panel, 250, 200);
+  lv_obj_center(panel);
+  lv_obj_set_style_radius(panel, 18, 0);
+  lv_obj_set_style_bg_color(panel, lv_color_hex(0x181818), 0);
+  lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(panel, lv_color_hex(0x303030), 0);
+  lv_obj_set_style_border_width(panel, 1, 0);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(panel);
+  lv_obj_set_style_text_font(title, &font_latin_22, 0);
+  lv_obj_set_style_text_color(title, lv_color_white(), 0);
+  lv_label_set_text(title, "Brightness");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+
+  dlg_value = lv_label_create(panel);
+  lv_obj_set_style_text_font(dlg_value, &font_latin_16, 0);
+  lv_obj_set_style_text_color(dlg_value, lv_color_hex(COL_GREY), 0);
+  lv_obj_align(dlg_value, LV_ALIGN_TOP_MID, 0, 48);
+
+  dlg_slider = lv_slider_create(panel);
+  lv_obj_set_size(dlg_slider, 190, 10);
+  lv_obj_align(dlg_slider, LV_ALIGN_TOP_MID, 0, 92);
+  lv_slider_set_range(dlg_slider, 1, 10); // x10 = 10..100 %, step 10
+  lv_slider_set_value(dlg_slider, bright_full / 10, LV_ANIM_OFF);
+  lv_obj_set_ext_click_area(dlg_slider, 20); // easier to grab on a small screen
+  lv_obj_set_style_bg_color(dlg_slider, lv_color_hex(0x3A3A3A), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(dlg_slider, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(dlg_slider, lv_color_hex(COL_GREEN), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(dlg_slider, lv_color_white(), LV_PART_KNOB);
+  lv_obj_set_style_pad_all(dlg_slider, 6, LV_PART_KNOB);
+  lv_obj_add_event_cb(dlg_slider, on_dlg_slider, LV_EVENT_VALUE_CHANGED, NULL);
+  dlg_show_value(bright_full);
+
+  make_dlg_button(panel, "Cancel", false, -58);
+  make_dlg_button(panel, "Save", true, 58);
+
+  set_brightness(bright_full); // in case the screen was dimmed
+  dimmed = false;
+}
+
 static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, uint32_t color,
                             lv_coord_t w, lv_coord_t y, lv_label_long_mode_t mode)
 {
@@ -315,7 +483,7 @@ static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, uint32_t co
 
 static void build_ui()
 {
-  lv_obj_t *scr = lv_scr_act();
+  lv_obj_t *scr = scr_main = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
@@ -346,6 +514,7 @@ static void build_ui()
   lv_obj_set_style_bg_opa(art_box, LV_OPA_COVER, 0);
   lv_obj_clear_flag(art_box, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(art_box, on_art_clicked, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_event_cb(art_box, on_art_pressed, LV_EVENT_PRESSED, NULL);
 
   memset(&art_dsc, 0, sizeof art_dsc);
   art_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
@@ -392,14 +561,17 @@ static void build_ui()
   // Navigation
   btn_prev = make_nav(scr, LV_SYMBOL_PREV, -118, CMD_PREV);
   btn_next = make_nav(scr, LV_SYMBOL_NEXT, 118, CMD_NEXT);
-}
 
-static void show(lv_obj_t *o, bool visible)
-{
-  if (visible)
-    lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
-  else
-    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+  // Separate screen shown (briefly) while the PC is off
+  scr_off = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(scr_off, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(scr_off, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(scr_off, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *off = lv_label_create(scr_off);
+  lv_obj_set_style_text_font(off, &font_latin_22, 0);
+  lv_obj_set_style_text_color(off, lv_color_hex(COL_GREY), 0);
+  lv_label_set_text(off, "PC is off");
+  lv_obj_center(off);
 }
 
 static void apply_idle(bool idle)
@@ -501,6 +673,22 @@ static void ui_tick(lv_timer_t *)
     shown_arc = 0;
   }
 
+  // Long press on the artwork opens the brightness dialog
+  static uint32_t art_press_start = 0;
+  if (!ui_idle && !dlg_backdrop && lv_obj_has_state(art_box, LV_STATE_PRESSED))
+  {
+    if (!art_press_start)
+      art_press_start = t;
+    else if (t - art_press_start >= SETTINGS_HOLD_MS)
+    {
+      art_long_fired = true; // the release must not toggle play/pause
+      art_press_start = 0;
+      dlg_open();
+    }
+  }
+  else
+    art_press_start = 0;
+
   // Tap feedback expiry
   if (tap_until && (int32_t)(t - tap_until) >= 0)
   {
@@ -513,12 +701,92 @@ static void ui_tick(lv_timer_t *)
     idle_since = 0;
   else if (!idle_since)
     idle_since = t;
-  bool dim = idle && t - idle_since >= DIM_AFTER_MS &&
+  bool dim = idle && !dlg_backdrop && t - idle_since >= DIM_AFTER_MS &&
              lv_disp_get_inactive_time(NULL) >= DIM_AFTER_MS;
   if (dim != dimmed)
   {
-    set_brightness(dim ? BRIGHT_DIM : BRIGHT_FULL);
+    set_brightness(dim ? BRIGHT_DIM : bright_full);
     dimmed = dim;
+  }
+}
+
+// ============================================================ PC presence ==
+// A powered, awake USB host sends a start-of-frame packet every 1 ms, even when
+// no program has the port open. The USB Serial/JTAG peripheral latches the
+// 11-bit frame number: if it stops changing, the PC is off, asleep or gone.
+// While it is, the board does the minimum: backlight off, no LVGL rendering
+// (the panel keeps the last image in its own RAM), slower CPU, and one cheap
+// touch read every 100 ms.
+
+static bool usb_host_alive(uint32_t t)
+{
+#if ARDUINO_USB_MODE // native USB Serial/JTAG (this board)
+  uint32_t f = REG_GET_FIELD(USB_SERIAL_JTAG_FRAM_NUM_REG, USB_SERIAL_JTAG_SOF_FRAME_INDEX);
+  if (f != last_frame)
+  {
+    last_frame = f;
+    last_sof_ms = t;
+  }
+  return t - last_sof_ms < PC_OFF_AFTER_MS;
+#else
+  return true; // USB-OTG/TinyUSB mode: frame register unused, feature off
+#endif
+}
+
+static void enter_pc_off()
+{
+  pc_off = true;
+  if (dlg_backdrop) // drop an open brightness dialog without saving
+  {
+    lv_obj_del(dlg_backdrop);
+    dlg_backdrop = nullptr;
+  }
+  show(tap_disc, false);
+  tap_until = 0;
+
+  lv_scr_load(scr_off);
+  lv_refr_now(NULL);    // draw "PC is off" once, while the backlight is still on
+  screen_switch(false); // ...then go dark; the panel retains the image
+  peek_until = 0;
+#if PC_OFF_CPU_MHZ
+  setCpuFrequencyMhz(PC_OFF_CPU_MHZ);
+#endif
+}
+
+static void leave_pc_off()
+{
+#if PC_OFF_CPU_MHZ
+  setCpuFrequencyMhz(240);
+#endif
+  pc_off = false;
+  peek_until = 0;
+  now.link = false; // anything we knew is stale; the bridge resends on HELLO
+  now.session = false;
+  lv_scr_load(scr_main);
+  ui_first = true; // re-apply the idle/playing layout on the next tick
+  dimmed = false;
+  screen_switch(true);
+  set_brightness(bright_full);
+  lv_disp_trig_activity(NULL);
+  send_hello();
+}
+
+static void pc_off_step(uint32_t t)
+{
+  if (peek_until && (int32_t)(t - peek_until) >= 0)
+  {
+    screen_switch(false);
+    peek_until = 0;
+  }
+  ESP_PanelTouchPoint p;
+  if (touch && touch->readPoints(&p, 1) > 0)
+  {
+    if (!peek_until)
+    {
+      screen_switch(true);
+      set_brightness(bright_full);
+    }
+    peek_until = t + PC_OFF_PEEK_MS; // a held finger keeps it lit
   }
 }
 
@@ -543,15 +811,36 @@ void setup()
     }
   }
 
-  scr_lvgl_init();
+  load_brightness(); // saved setting, or 100 % on first boot
+  scr_lvgl_init();   // vendor init switches the backlight on at 100 %
+  set_brightness(bright_full);
   build_ui();
   lv_timer_create(ui_tick, 100, NULL);
   ui_tick(NULL);
   send_hello();
+  last_sof_ms = millis(); // grace period while USB enumerates
 }
 
 void loop()
 {
+  uint32_t t = millis();
+  bool host = usb_host_alive(t);
+  if (pc_off)
+  {
+    if (!host)
+    {
+      pc_off_step(t);
+      delay(PC_OFF_POLL_MS); // the CPU idles in between
+      return;
+    }
+    leave_pc_off();
+  }
+  else if (!host)
+  {
+    enter_pc_off();
+    return;
+  }
+
   serial_poll();
   lv_timer_handler();
   delay(2);

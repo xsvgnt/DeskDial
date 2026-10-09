@@ -69,10 +69,20 @@ The program is at `pc\NowPlayingBridge\bin\Release\net8.0-windows10.0.19041.0\wi
   for 700 ms the state it's moving *to*. The PC confirms the real state about 150 ms later.
   Stale frames are ignored for 1.5 s after a tap so the UI doesn't flicker back.
 - **Prev / next** buttons sit at the left and right edges.
+- **Brightness:** hold the artwork for 5 s to open the *Brightness* dialog. The slider goes from 10 % to
+  100 % in steps of 10 and previews live. *Cancel* restores the previous level. *Save* stores it in the
+  board's flash (NVS), and it's applied at every boot (100 % until something is saved). Idle dimming
+  still drops to 10 %, and the screen returns to the saved level on wake.
 - **Idle:** shown when Spotify isn't running, when the PC program isn't connected (5 s timeout),
   or when the track has been **paused for 120 s**. The display shows "Nothing is playing" and hides
   the buttons. The artwork stops responding to taps. After 10 s the backlight dims to 10 %, and it
-  comes back to full brightness on any touch or when a track starts.
+  comes back to the saved brightness on any touch or when a track starts.
+- **PC off or asleep:** an awake PC sends a USB heartbeat every millisecond, even with no program
+  running. When it stops for 2 s, the board goes fully dark. It stops drawing the screen, slows the CPU to
+  80 MHz, and only checks the touch panel every 100 ms. A touch lights the screen for 5 s with "PC is off".
+  When the heartbeat returns, the board wakes on its own and the bridge reconnects. This needs the
+  native USB port and *USB CDC On Boot: Enabled*. If the CPU clock change ever causes trouble, set
+  `PC_OFF_CPU_MHZ` to 0 in the sketch.
 - Track titles are filtered on the PC to the characters the fonts contain. Letters with accents outside
   Latin-1 lose the accent (ą → a). Other scripts show as `?`.
 
