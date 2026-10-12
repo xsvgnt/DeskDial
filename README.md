@@ -65,7 +65,7 @@ To run it on a PC without the SDK, install the **.NET 8 Desktop Runtime**; the b
 non-Latin titles.
 
 - First run: `NowPlayingBridge.exe --debug` shows port probing, track changes, commands and which
-  sensors were picked. Run it from an **administrator** terminal to see temperatures.
+  sensors were picked. Every 30 s it also logs a `memory:` line with the allocation rate and heap size. Run it from an **administrator** terminal to see temperatures.
 - It finds the board by probing every COM port for its handshake. Use `--port COM5` to skip probing.
 - **Which app it shows:** whatever is actually playing, whether that's Spotify, a browser tab (YouTube in Chrome,
   Edge or Firefox) or VLC. If several play at once, it follows Windows' own media flyout. When nothing is

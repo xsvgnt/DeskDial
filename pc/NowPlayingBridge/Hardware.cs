@@ -80,9 +80,16 @@ sealed class HardwareMonitor : IDisposable
         Resolve();
     }
 
-    void UpdateAll()
+    int _updates;
+
+    /// slowToo = also refresh storage and RAM modules. Their temperatures move
+    /// slowly and reading them (SMART, SMBus) is the costliest part, so the
+    /// once-a-second sample only includes them every 10th time.
+    void UpdateAll(bool slowToo = true)
     {
-        foreach (var hw in _pc!.Hardware) Update(hw);
+        foreach (var hw in _pc!.Hardware)
+            if (slowToo || hw.HardwareType is not (HardwareType.Storage or HardwareType.Memory))
+                Update(hw);
         static void Update(IHardware h)
         {
             h.Update();
@@ -232,7 +239,7 @@ sealed class HardwareMonitor : IDisposable
         try
         {
             EnsureOpen();
-            UpdateAll();
+            UpdateAll(slowToo: _updates++ % 10 == 0);
             foreach (var (m, sensor) in _map)
             {
                 if (sensor.Value is not float v || float.IsNaN(v)) continue;

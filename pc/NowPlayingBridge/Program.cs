@@ -275,6 +275,24 @@ sealed class Bridge
     int _artAttempts;
     uint _sentArtId = uint.MaxValue;
     readonly string?[] _sentTextImg = new string?[2]; // per field: text sent as image, "" = label
+    readonly string?[] _textSeen = new string?[2];    // per field: last text checked for images
+
+    // Cached media state. Windows is only queried for the part an event says
+    // changed (plus a full re-read every 15 s as a safety net); the 1 s
+    // heartbeat re-sends from this cache without touching WinRT, so it no
+    // longer creates a stream of short-lived WinRT objects.
+    volatile bool _watchDirty = true, _selectDirty = true;
+    volatile bool _mediaDirty = true, _playbackDirty = true, _timelineDirty = true;
+    readonly List<Session> _watched = new();
+    DateTime _nextSafetyRefresh;
+    string _title = "", _artist = "", _album = "", _mediaKey = "";
+    IRandomAccessStreamReference? _thumb;
+    PlaybackStatus _status = PlaybackStatus.Closed;
+    TimeSpan _tlStart, _tlEnd, _tlPos;
+    DateTimeOffset _tlUpdated;
+    string? _stTitle, _stArtist;          // BuildState cache
+    byte[] _stTitleBytes = Array.Empty<byte>(), _stArtistBytes = Array.Empty<byte>();
+    long _hwAllocated;                    // bytes allocated by sensor reads (debug stats)
 
     public Bridge(string? port, bool spotifyOnly, HardwareMonitor hw)
     {
@@ -291,9 +309,10 @@ sealed class Bridge
     public async Task RunAsync()
     {
         _mgr = await SessionManager.RequestAsync();
-        _mgr.SessionsChanged += (_, _) => { _sessionsChanged = true; Wake(); };
-        _mgr.CurrentSessionChanged += (_, _) => { _sessionsChanged = true; Wake(); };
+        _mgr.SessionsChanged += (_, _) => { _sessionsChanged = true; _watchDirty = true; _selectDirty = true; Wake(); };
+        _mgr.CurrentSessionChanged += (_, _) => { _selectDirty = true; Wake(); };
         _ = Task.Run(HardwareLoopAsync);
+        if (Log.Enabled) _ = Task.Run(MemoryStatsLoopAsync);
 
         while (true)
         {
@@ -311,7 +330,7 @@ sealed class Bridge
                     }
                     _needFull = true;
                 }
-                await SelectSessionAsync();
+                await RefreshAsync();
                 await PushAsync(_link);
             }
             catch (Exception e)
@@ -319,6 +338,7 @@ sealed class Bridge
                 Log.Write($"loop: {e}");
             }
             await _wake.WaitAsync(1000); // event-driven, plus a 1 s heartbeat
+            await Task.Delay(100);       // let a burst of events collapse into one refresh
         }
     }
 
@@ -375,7 +395,9 @@ sealed class Bridge
             Log.Write($"command {cmd} failed: {e.Message}");
         }
         // Push the real state soon after, so the board's optimistic UI settles.
+        _playbackDirty = _timelineDirty = _mediaDirty = true;
         await Task.Delay(150); Wake();
+        _playbackDirty = _timelineDirty = true;
         await Task.Delay(500); Wake();
     }
 
@@ -389,7 +411,9 @@ sealed class Bridge
             var link = _link;
             if (_hwWanted && link is not null && !link.Dead)
             {
+                long before = GC.GetAllocatedBytesForCurrentThread();
                 var (data, temps) = _hw.Sample();
+                Interlocked.Add(ref _hwAllocated, GC.GetAllocatedBytesForCurrentThread() - before);
                 var payload = new byte[1 + data.Count * 5];
                 payload[0] = (byte)data.Count;
                 for (int i = 0; i < data.Count; i++)
@@ -414,6 +438,25 @@ sealed class Bridge
         }
     }
 
+    /// --debug only: allocation rate and heap size every 30 s, to check that
+    /// memory stays flat (a sawtooth from 30 MB to 230 MB means garbage).
+    async Task MemoryStatsLoopAsync()
+    {
+        long last = GC.GetTotalAllocatedBytes(), lastHw = 0;
+        while (true)
+        {
+            await Task.Delay(30_000);
+            long now = GC.GetTotalAllocatedBytes(), hw = Interlocked.Read(ref _hwAllocated);
+            Log.Write($"memory: {(now - last) / 30.0 / 1024:0.0} KB/s allocated " +
+                      $"({(hw - lastHw) / 30.0 / 1024:0.0} KB/s by sensor reads), " +
+                      $"GC heap {GC.GetTotalMemory(false) / 1048576.0:0.0} MB, " +
+                      $"working set {Environment.WorkingSet / 1048576.0:0} MB, " +
+                      $"collections {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}");
+            last = now;
+            lastHw = hw;
+        }
+    }
+
     // ------------------------------------------------------------ sessions --
     static bool IsSpotify(Session s) =>
         s.SourceAppUserModelId.Contains("Spotify", StringComparison.OrdinalIgnoreCase);
@@ -435,6 +478,95 @@ sealed class Bridge
             return !string.IsNullOrEmpty(props?.Title);
         }
         catch { return false; }
+    }
+
+    /// Watches every app's play/pause and track changes, so the choice of app
+    /// is re-evaluated only when something actually changed.
+    void WatchAllSessions()
+    {
+        foreach (var w in _watched)
+        {
+            try
+            {
+                w.PlaybackInfoChanged -= OnAnyPlaybackChanged;
+                w.MediaPropertiesChanged -= OnAnyMediaChanged;
+            }
+            catch { /* already gone */ }
+        }
+        _watched.Clear();
+        try
+        {
+            foreach (var w in _mgr.GetSessions())
+            {
+                w.PlaybackInfoChanged += OnAnyPlaybackChanged;
+                w.MediaPropertiesChanged += OnAnyMediaChanged;
+                _watched.Add(w);
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Write($"watch sessions: {e.Message}");
+        }
+    }
+
+    void OnAnyPlaybackChanged(Session s, PlaybackInfoChangedEventArgs a) { _selectDirty = true; Wake(); }
+    void OnAnyMediaChanged(Session s, MediaPropertiesChangedEventArgs a) { _selectDirty = true; Wake(); }
+
+    /// Re-reads from Windows only what an event marked as changed.
+    async Task RefreshAsync()
+    {
+        if (DateTime.UtcNow >= _nextSafetyRefresh) // in case an event was missed
+        {
+            _nextSafetyRefresh = DateTime.UtcNow.AddSeconds(15);
+            _watchDirty = _selectDirty = _mediaDirty = _playbackDirty = _timelineDirty = true;
+        }
+        if (_watchDirty) { _watchDirty = false; WatchAllSessions(); }
+        if (_selectDirty) { _selectDirty = false; await SelectSessionAsync(); }
+
+        var s = _session;
+        if (s is null)
+        {
+            _title = _artist = _album = _mediaKey = "";
+            _thumb = null;
+            _status = PlaybackStatus.Closed;
+            _tlStart = _tlEnd = _tlPos = TimeSpan.Zero;
+            return;
+        }
+        try
+        {
+            // Flags are cleared before reading, so an event arriving meanwhile
+            // marks the data dirty again instead of being lost.
+            if (_mediaDirty)
+            {
+                _mediaDirty = false;
+                var props = await s.TryGetMediaPropertiesAsync();
+                _title = props?.Title ?? "";
+                _artist = props?.Artist ?? "";
+                if (_artist.Length == 0) _artist = props?.AlbumArtist ?? "";
+                _album = props?.AlbumTitle ?? "";
+                _thumb = props?.Thumbnail;
+                _mediaKey = $"{_title}\u0001{_artist}\u0001{_album}\u0001{_thumb is not null}";
+            }
+            if (_playbackDirty)
+            {
+                _playbackDirty = false;
+                _status = StatusOf(s);
+            }
+            if (_timelineDirty)
+            {
+                _timelineDirty = false;
+                var tl = s.GetTimelineProperties();
+                _tlStart = tl?.StartTime ?? TimeSpan.Zero;
+                _tlEnd = tl?.EndTime ?? TimeSpan.Zero;
+                _tlPos = tl?.Position ?? TimeSpan.Zero;
+                _tlUpdated = tl?.LastUpdatedTime ?? default;
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Write($"read session: {e.Message}");
+            _status = PlaybackStatus.Closed;
+        }
     }
 
     /// Which app to show, in order:
@@ -491,6 +623,7 @@ sealed class Bridge
 
         _session = pick;
         _sessionId = id;
+        _mediaDirty = _playbackDirty = _timelineDirty = true;
         if (pick is not null)
         {
             pick.MediaPropertiesChanged += OnMediaChanged;
@@ -500,68 +633,44 @@ sealed class Bridge
         Log.Write($"session: {(id == "" ? "(none)" : id)}");
     }
 
-    void OnMediaChanged(Session s, MediaPropertiesChangedEventArgs a) => Wake();
-    void OnPlaybackChanged(Session s, PlaybackInfoChangedEventArgs a) => Wake();
-    void OnTimelineChanged(Session s, TimelinePropertiesChangedEventArgs a) => Wake();
+    // The shown app's own events: mark exactly what to re-read.
+    void OnMediaChanged(Session s, MediaPropertiesChangedEventArgs a) { _mediaDirty = true; Wake(); }
+    void OnPlaybackChanged(Session s, PlaybackInfoChangedEventArgs a) { _playbackDirty = _timelineDirty = true; Wake(); }
+    void OnTimelineChanged(Session s, TimelinePropertiesChangedEventArgs a) { _timelineDirty = true; Wake(); }
 
     // ---------------------------------------------------------------- push --
+    /// Sends the cached state. No WinRT calls here except loading new artwork.
     async Task PushAsync(Link link)
     {
-        string title = "", artist = "", album = "";
-        bool has = false, playing = false;
+        string title = _title, artist = _artist;
+        var thumb = _thumb;
+        bool playing = _status == PlaybackStatus.Playing;
+        bool has = title.Length > 0 && _status is PlaybackStatus.Playing or PlaybackStatus.Paused or PlaybackStatus.Changing;
         uint posMs = 0, durMs = 0;
-        IRandomAccessStreamReference? thumb = null;
 
-        var s = _session;
-        if (s is not null)
+        // An empty timeline (no duration) means "position unknown": browsers
+        // publish one when a video loads or changes (Chromium's ClearPosition)
+        // and only send a real one on the next play/pause/seek. Send 0/0 and let
+        // the board hide the time, rather than extrapolating a fake counter.
+        var dur = _tlEnd - _tlStart;
+        if (has && dur > TimeSpan.Zero)
         {
-            try
+            var pos = _tlPos - _tlStart;
+            // Players report the position only on play/pause/seek: extrapolate.
+            if (playing && _tlUpdated.Year > 2000)
             {
-                var props = await s.TryGetMediaPropertiesAsync();
-                var pb = s.GetPlaybackInfo();
-                var tl = s.GetTimelineProperties();
-
-                title = props?.Title ?? "";
-                artist = props?.Artist ?? "";
-                if (artist.Length == 0) artist = props?.AlbumArtist ?? "";
-                album = props?.AlbumTitle ?? "";
-                thumb = props?.Thumbnail;
-
-                var status = pb?.PlaybackStatus ?? PlaybackStatus.Closed;
-                playing = status == PlaybackStatus.Playing;
-                has = title.Length > 0 && status is PlaybackStatus.Playing or PlaybackStatus.Paused or PlaybackStatus.Changing;
-
-                // An empty timeline (no duration) means "position unknown": browsers
-                // publish one when a video loads or changes (Chromium's ClearPosition)
-                // and only send a real one on the next play/pause/seek. Send 0/0 and let
-                // the board hide the time, rather than extrapolating a fake counter.
-                if (tl is not null && tl.EndTime - tl.StartTime > TimeSpan.Zero)
-                {
-                    var dur = tl.EndTime - tl.StartTime;
-                    var pos = tl.Position - tl.StartTime;
-                    // Players report the position only on play/pause/seek: extrapolate.
-                    if (playing && tl.LastUpdatedTime.Year > 2000)
-                    {
-                        var age = DateTimeOffset.Now - tl.LastUpdatedTime;
-                        if (age > TimeSpan.Zero && age < TimeSpan.FromHours(12)) pos += age;
-                    }
-                    if (dur < TimeSpan.Zero) dur = TimeSpan.Zero;
-                    if (pos < TimeSpan.Zero) pos = TimeSpan.Zero;
-                    if (dur > TimeSpan.Zero && pos > dur) pos = dur;
-                    durMs = (uint)Math.Min(dur.TotalMilliseconds, uint.MaxValue);
-                    posMs = (uint)Math.Min(pos.TotalMilliseconds, uint.MaxValue);
-                }
+                var age = DateTimeOffset.Now - _tlUpdated;
+                if (age > TimeSpan.Zero && age < TimeSpan.FromHours(12)) pos += age;
             }
-            catch (Exception e)
-            {
-                Log.Write($"read session: {e.Message}");
-                has = false;
-            }
+            if (pos < TimeSpan.Zero) pos = TimeSpan.Zero;
+            if (pos > dur) pos = dur;
+            durMs = (uint)Math.Min(dur.TotalMilliseconds, uint.MaxValue);
+            posMs = (uint)Math.Min(pos.TotalMilliseconds, uint.MaxValue);
         }
 
         // Artwork: reload when the track changes; retry a couple of times because
         // the thumbnail often lands a moment after the title.
-        string key = has ? $"{title}\u0001{artist}\u0001{album}\u0001{thumb is not null}" : "";
+        string key = has ? _mediaKey : "";
         if (key != _artKey)
         {
             _artKey = key;
@@ -606,6 +715,8 @@ sealed class Bridge
 
     async Task SendTextImageAsync(Link link, byte field, string text, bool full)
     {
+        if (!full && _textSeen[field] == text) return; // unchanged: nothing to check
+        _textSeen[field] = text;
         string key = TextFilter.AllSupported(text) ? "" : text;
         if (!full && _sentTextImg[field] == key) return;
         _sentTextImg[field] = key;
@@ -625,10 +736,13 @@ sealed class Bridge
         Log.Write($"text image: field {field}, {bmp.Width}x{bmp.Height}, \"{key}\"");
     }
 
-    static byte[] BuildState(bool has, bool playing, uint pos, uint dur, uint artId, string title, string artist)
+    byte[] BuildState(bool has, bool playing, uint pos, uint dur, uint artId, string title, string artist)
     {
-        var t = Utf8Clip(TextFilter.ForDisplay(title), 200);
-        var a = Utf8Clip(TextFilter.ForDisplay(artist), 200);
+        // Converted once per track, not once per heartbeat
+        if (title != _stTitle) { _stTitle = title; _stTitleBytes = Utf8Clip(TextFilter.ForDisplay(title), 200); }
+        if (artist != _stArtist) { _stArtist = artist; _stArtistBytes = Utf8Clip(TextFilter.ForDisplay(artist), 200); }
+        var t = _stTitleBytes;
+        var a = _stArtistBytes;
         var p = new byte[13 + 1 + t.Length + 1 + a.Length];
         p[0] = (byte)((has ? Proto.FlagSession : 0) | (has && playing ? Proto.FlagPlaying : 0));
         BitConverter.TryWriteBytes(p.AsSpan(1), pos);
