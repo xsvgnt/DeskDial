@@ -12,6 +12,8 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
+    <!-- WPF's text engine renders titles in scripts the board has no font for -->
+    <UseWPF>true</UseWPF>
   </PropertyGroup>
 
   <ItemGroup>

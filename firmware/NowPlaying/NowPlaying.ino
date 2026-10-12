@@ -89,6 +89,17 @@ static lv_img_dsc_t art_dsc;
 // -------------------------------------------------------------------- UI --
 static lv_obj_t *arc, *art_box, *art_img, *art_placeholder, *tap_disc, *tap_icon;
 static lv_obj_t *lbl_title, *lbl_artist, *lbl_time, *lbl_idle, *btn_prev, *btn_next;
+
+// Title/artist rendered by the PC (scripts the board's fonts lack). Each field
+// has a clipping box; the title box holds two copies of the image for a
+// seamless scroll, like the label's circular mode.
+static const lv_coord_t TEXT_BOX_W = 240;
+static const lv_coord_t MARQUEE_GAP = 40;
+static const uint8_t TEXT_IMG_MAX_H = TEXT_IMG_TITLE_H;
+static uint8_t *text_img_buf[2];
+static lv_img_dsc_t text_img_dsc[2];
+static bool text_img_on[2];
+static lv_obj_t *text_box[2], *text_img[2], *title_img_copy;
 static bool ui_idle = false, ui_first = true, dimmed = false;
 static uint32_t idle_since = 0, tap_until = 0;
 static bool art_long_fired = false; // swallow the click that ends a long press
@@ -269,6 +280,26 @@ static void handle_frame(uint8_t type, const uint8_t *p, uint32_t len)
       }
       hw_temp_count = n;
       hw_dirty = true;
+    }
+    break;
+  case MSG_TEXT_IMG:
+    if (len >= 5 && p[0] <= TEXT_FIELD_ARTIST)
+    {
+      uint8_t f = p[0];
+      uint16_t w = p[1] | (p[2] << 8), h = p[3] | (p[4] << 8);
+      uint32_t bytes = (uint32_t)((w + 1) / 2) * h;
+      uint16_t max_w = f == TEXT_FIELD_TITLE ? TEXT_IMG_TITLE_MAX_W : TEXT_IMG_ARTIST_MAX_W;
+      if (w == 0)
+        text_img_on[f] = false;
+      else if (w <= max_w && h <= TEXT_IMG_MAX_H && len == 5 + bytes)
+      {
+        memcpy(text_img_buf[f], p + 5, bytes); // safe: rendering happens later in this task
+        text_img_dsc[f].header.w = w;
+        text_img_dsc[f].header.h = h;
+        text_img_dsc[f].data_size = bytes;
+        text_img_on[f] = true;
+      }
+      now.text_dirty = true;
     }
     break;
   case MSG_ART_NONE:
@@ -557,6 +588,95 @@ static lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, uint32_t co
   return l;
 }
 
+// ------------------------------------------------------- text images --
+// Box placed so the image's baseline row lands on the label's baseline.
+static void make_text_box(lv_obj_t *scr, uint8_t f, lv_coord_t label_y, const lv_font_t *font,
+                          lv_coord_t h, lv_coord_t baseline, uint32_t color)
+{
+  lv_coord_t label_baseline = label_y + font->line_height - font->base_line;
+  lv_obj_t *box = lv_obj_create(scr);
+  lv_obj_remove_style_all(box);
+  lv_obj_set_size(box, TEXT_BOX_W, h);
+  lv_obj_align(box, LV_ALIGN_TOP_MID, 0, label_baseline - baseline);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN);
+  text_box[f] = box;
+
+  memset(&text_img_dsc[f], 0, sizeof(lv_img_dsc_t));
+  text_img_dsc[f].header.cf = LV_IMG_CF_ALPHA_4BIT; // colour comes from img_recolor
+  text_img_dsc[f].data = text_img_buf[f];
+
+  int copies = f == TEXT_FIELD_TITLE ? 2 : 1;
+  for (int i = 0; i < copies; i++)
+  {
+    lv_obj_t *img = lv_img_create(box);
+    lv_obj_set_style_img_recolor(img, lv_color_hex(color), 0);
+    lv_obj_set_style_img_recolor_opa(img, LV_OPA_COVER, 0); // LVGL ignores the colour at opa 0
+    lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
+    if (i == 0)
+      text_img[f] = img;
+    else
+      title_img_copy = img;
+  }
+}
+
+static void marquee_cb(void *var, int32_t x)
+{
+  lv_obj_set_x(text_img[TEXT_FIELD_TITLE], x);
+  lv_obj_set_x(title_img_copy, x + text_img_dsc[TEXT_FIELD_TITLE].header.w + MARQUEE_GAP);
+}
+
+static void apply_text_img(uint8_t f)
+{
+  lv_obj_t *img = text_img[f];
+  if (f == TEXT_FIELD_TITLE)
+  {
+    lv_anim_del(img, marquee_cb);
+    show(title_img_copy, false);
+  }
+  if (!text_img_on[f])
+  {
+    show(img, false);
+    return;
+  }
+  lv_img_set_src(img, &text_img_dsc[f]);
+  show(img, true);
+  lv_coord_t w = text_img_dsc[f].header.w;
+  if (w <= TEXT_BOX_W || f != TEXT_FIELD_TITLE)
+  {
+    lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 0); // fits: centred, like the label
+    return;
+  }
+  // Too wide: scroll left forever; the copy follows one gap behind, so the
+  // jump from -span back to 0 is invisible.
+  lv_img_set_src(title_img_copy, &text_img_dsc[f]);
+  show(title_img_copy, true);
+  lv_obj_align(img, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_align(title_img_copy, LV_ALIGN_TOP_LEFT, 0, 0);
+  int32_t span = w + MARQUEE_GAP;
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, img);
+  lv_anim_set_exec_cb(&a, marquee_cb);
+  lv_anim_set_values(&a, 0, -span);
+  lv_anim_set_time(&a, span * 1000 / (lv_disp_get_dpi(NULL) / 3)); // same speed as a scrolling label
+  lv_anim_set_delay(&a, 1000);
+  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_start(&a);
+  marquee_cb(img, 0);
+}
+
+// Shows each field as either its label or its PC-rendered image.
+static void show_track_text(bool visible)
+{
+  lv_obj_t *labels[2] = {lbl_title, lbl_artist};
+  for (int f = 0; f < 2; f++)
+  {
+    show(labels[f], visible && !text_img_on[f]);
+    show(text_box[f], visible && text_img_on[f]);
+  }
+}
+
 static void build_ui()
 {
   lv_obj_t *scr = scr_main = lv_scr_act();
@@ -631,6 +751,8 @@ static void build_ui()
   // Text
   lbl_title = make_label(scr, &font_latin_22, 0xFFFFFF, 240, 230, LV_LABEL_LONG_SCROLL_CIRCULAR);
   lbl_artist = make_label(scr, &font_latin_16, COL_GREY, 240, 262, LV_LABEL_LONG_DOT);
+  make_text_box(scr, TEXT_FIELD_TITLE, 230, &font_latin_22, TEXT_IMG_TITLE_H, TEXT_IMG_TITLE_BASELINE, 0xFFFFFF);
+  make_text_box(scr, TEXT_FIELD_ARTIST, 262, &font_latin_16, TEXT_IMG_ARTIST_H, TEXT_IMG_ARTIST_BASELINE, COL_GREY);
   lbl_time = make_label(scr, &font_latin_14, COL_GREY, 170, 290, LV_LABEL_LONG_CLIP);
   lbl_idle = make_label(scr, &font_latin_22, COL_GREY, 240, 230, LV_LABEL_LONG_WRAP);
   lv_label_set_text(lbl_idle, "Nothing is playing");
@@ -967,8 +1089,7 @@ static void apply_idle(bool idle)
 {
   ui_idle = idle;
   show(lbl_idle, idle);
-  show(lbl_title, !idle);
-  show(lbl_artist, !idle);
+  show_track_text(!idle);
   show(lbl_time, !idle);
   show(btn_prev, !idle);
   show(btn_next, !idle);
@@ -1032,6 +1153,9 @@ static void ui_tick(lv_timer_t *)
     {
       lv_label_set_text(lbl_title, now.title);
       lv_label_set_text(lbl_artist, now.artist);
+      apply_text_img(TEXT_FIELD_TITLE);
+      apply_text_img(TEXT_FIELD_ARTIST);
+      show_track_text(true);
       now.text_dirty = false;
     }
     uint32_t pos = current_pos(t);
@@ -1194,7 +1318,10 @@ void setup()
 
   art_buf = (uint8_t *)heap_caps_calloc(1, ART_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   rx_buf = (uint8_t *)heap_caps_malloc(NPR_MAX_PAYLOAD, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!art_buf || !rx_buf)
+  for (int f = 0; f < 2; f++)
+    text_img_buf[f] = (uint8_t *)heap_caps_malloc((TEXT_IMG_TITLE_MAX_W + 1) / 2 * TEXT_IMG_MAX_H,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!art_buf || !rx_buf || !text_img_buf[0] || !text_img_buf[1])
   {
     // PSRAM missing: enable "OPI PSRAM" in the board settings
     while (true)

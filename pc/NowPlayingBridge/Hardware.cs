@@ -15,6 +15,7 @@
 //              "GPU Memory Used" / "GPU Memory Total"
 //   Bottom row "RAM" = hottest "DIMM #n" reading, then the SSD
 
+using System.IO; // not implicit in WPF projects
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text.RegularExpressions;
@@ -274,7 +275,7 @@ sealed class HardwareMonitor : IDisposable
         // System drive (not on screen yet, available for future layouts)
         try
         {
-            var root = Path.GetPathRoot(Environment.SystemDirectory) ?? "C:\\";
+            var root = System.IO.Path.GetPathRoot(Environment.SystemDirectory) ?? "C:\\";
             var d = new DriveInfo(root);
             const float GB = 1024f * 1024f * 1024f;
             result.Add((Metric.DiskUsed, (d.TotalSize - d.AvailableFreeSpace) / GB));

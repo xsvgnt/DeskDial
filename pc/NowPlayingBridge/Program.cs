@@ -11,6 +11,7 @@
 // Usage: NowPlayingBridge.exe [--port COM5] [--spotify-only] [--debug]
 //        NowPlayingBridge.exe --list-sensors
 
+using System.IO; // not implicit in WPF projects
 using System.IO.Ports;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -56,7 +57,7 @@ static class Program
             }
         }
 
-        var overrides = HardwareMonitor.LoadOverrides(Path.Combine(AppContext.BaseDirectory, "sensors.ini"));
+        var overrides = HardwareMonitor.LoadOverrides(System.IO.Path.Combine(AppContext.BaseDirectory, "sensors.ini"));
         if (listSensors)
         {
             bool newWindow = OpenConsole();
@@ -96,7 +97,7 @@ static class Proto
 {
     public const byte Sync0 = 0xA5, Sync1 = 0x5A;
     public const byte Hello = 0x01, State = 0x02, Art = 0x03, ArtNone = 0x04, Hw = 0x05, HwTemps = 0x06,
-                      Cmd = 0x10, Page = 0x11;
+                      TextImg = 0x07, Cmd = 0x10, Page = 0x11;
     public const byte PageMedia = 0, PageHw = 1;
     public const byte CmdPlayPause = 1, CmdNext = 2, CmdPrev = 3;
     public const byte FlagSession = 0x01, FlagPlaying = 0x02;
@@ -273,6 +274,7 @@ sealed class Bridge
     byte[]? _artPixels;
     int _artAttempts;
     uint _sentArtId = uint.MaxValue;
+    readonly string?[] _sentTextImg = new string?[2]; // per field: text sent as image, "" = label
 
     public Bridge(string? port, bool spotifyOnly, HardwareMonitor hw)
     {
@@ -594,7 +596,33 @@ sealed class Bridge
             _sentArtId = _artId;
         }
 
+        // Text the board's fonts can't draw goes as an image, before the state
+        // frame so the new line appears together with the new track.
+        await SendTextImageAsync(link, 0, has ? title : "", full);
+        await SendTextImageAsync(link, 1, has ? artist : "", full);
+
         link.Send(Proto.State, BuildState(has, playing, posMs, durMs, _artId, title, artist));
+    }
+
+    async Task SendTextImageAsync(Link link, byte field, string text, bool full)
+    {
+        string key = TextFilter.AllSupported(text) ? "" : text;
+        if (!full && _sentTextImg[field] == key) return;
+        _sentTextImg[field] = key;
+
+        var img = key.Length > 0 ? await TextImage.RenderAsync(key, title: field == 0) : null;
+        if (img is not { } bmp)
+        {
+            link.Send(Proto.TextImg, new byte[] { field, 0, 0, 0, 0 }); // use the label
+            return;
+        }
+        var payload = new byte[5 + bmp.Alpha4.Length];
+        payload[0] = field;
+        BitConverter.TryWriteBytes(payload.AsSpan(1, 2), (ushort)bmp.Width);
+        BitConverter.TryWriteBytes(payload.AsSpan(3, 2), (ushort)bmp.Height);
+        bmp.Alpha4.CopyTo(payload, 5);
+        link.Send(Proto.TextImg, payload);
+        Log.Write($"text image: field {field}, {bmp.Width}x{bmp.Height}, \"{key}\"");
     }
 
     static byte[] BuildState(bool has, bool playing, uint pos, uint dur, uint artId, string title, string artist)
@@ -677,6 +705,11 @@ sealed class Bridge
 /// (ą -> a); anything else becomes '?'.
 static class TextFilter
 {
+    /// True when every character exists in the board's fonts (no image needed).
+    public static bool AllSupported(string s) =>
+        s.Normalize(NormalizationForm.FormC).EnumerateRunes()
+         .All(r => Supported(r.Value) || Rune.IsWhiteSpace(r) || Rune.IsControl(r));
+
     static bool Supported(int c) =>
         (c >= 0x20 && c <= 0x7E) || (c >= 0xA0 && c <= 0xFF) ||
         c is 0x152 or 0x153 or 0x178 or 0x2013 or 0x2014 or 0x2018 or 0x2019 or 0x201A

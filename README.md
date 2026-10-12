@@ -61,6 +61,8 @@ dotnet publish -c Release
 ```
 
 The program is at `pc\NowPlayingBridge\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\NowPlayingBridge.exe`.
+To run it on a PC without the SDK, install the **.NET 8 Desktop Runtime**; the bridge uses WPF to draw
+non-Latin titles.
 
 - First run: `NowPlayingBridge.exe --debug` shows port probing, track changes, commands and which
   sensors were picked. Run it from an **administrator** terminal to see temperatures.
@@ -148,8 +150,12 @@ to uninstall. Put `sensors.ini` in that installed folder.
     GPU, and the fill fraction for memory. They're the `SCALE_*` constants at the top of the sketch. It's never dimmed for idle, and values switch to `--`
   if no data arrives for 3 s. The "PC is off" dark mode applies to both pages. The brightness long-press
   is on the media page only.
-- Track titles are filtered on the PC to the characters the fonts contain. Letters with accents outside
-  Latin-1 lose the accent (ą → a). Other scripts show as `?`.
+- **Titles in any language:** Latin text is drawn by the board in Montserrat. When a title or artist
+  contains characters the board has no font for (Chinese, Japanese, Korean, Arabic, Hebrew, Thai, Cyrillic,
+  emoji…), the PC renders that line with Windows' fonts and sends it as a small image. Right-to-left text and
+  Arabic letter joining come out correctly, and long titles still scroll.
+
+  ![Japanese, Korean and Arabic titles](docs/other-scripts.png)
 
 ## Serial protocol
 

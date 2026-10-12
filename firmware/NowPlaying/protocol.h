@@ -17,6 +17,12 @@
 //   MSG_HW_TEMPS  count u8, then count x (label_len u8, label UTF-8,
 //                 value float32 LE): extra labelled temperatures (RAM
 //                 modules, SSD...), sent right after MSG_HW. Max HW_TEMPS_MAX.
+//   MSG_TEXT_IMG  field u8 (TEXT_FIELD_*), width u16 LE, height u16 LE, then
+//                 4-bit alpha pixels (rows of ceil(width/2) bytes, first pixel
+//                 in the high nibble). The PC renders title/artist text this
+//                 way when it uses characters the board's fonts don't have
+//                 (CJK, Arabic, ...). Width 0 = use the normal text label.
+//                 Sent before the MSG_STATE carrying the matching text.
 // ESP32 -> PC
 //   MSG_HELLO     "NPR1"                     at boot, every 2 s while unlinked,
 //                                            and in reply to the PC's HELLO
@@ -42,6 +48,7 @@ enum : uint8_t
   MSG_ART_NONE = 0x04,
   MSG_HW = 0x05,
   MSG_HW_TEMPS = 0x06,
+  MSG_TEXT_IMG = 0x07,
   MSG_CMD = 0x10,
   MSG_PAGE = 0x11,
 };
@@ -75,6 +82,20 @@ enum : uint8_t
   HW_DISK_TOTAL = 16,
   HW_COUNT = 17,
 };
+
+// Text images: fixed heights, text baseline at a fixed row so the board can
+// line them up with where its own labels would draw.
+enum : uint8_t
+{
+  TEXT_FIELD_TITLE = 0,
+  TEXT_FIELD_ARTIST = 1,
+};
+#define TEXT_IMG_TITLE_H 30
+#define TEXT_IMG_TITLE_BASELINE 23
+#define TEXT_IMG_TITLE_MAX_W 1024 // longer titles are cut with an ellipsis
+#define TEXT_IMG_ARTIST_H 24
+#define TEXT_IMG_ARTIST_BASELINE 18
+#define TEXT_IMG_ARTIST_MAX_W 240 // = visible width, ellipsis like the label
 
 #define HW_TEMPS_MAX 3
 #define HW_TEMP_LABEL_MAX 11 // bytes, UTF-8
