@@ -5,7 +5,11 @@
 // second, and executes play/pause/next/previous commands coming back.
 // Wire format: see firmware/NowPlaying/protocol.h.
 //
+// It also sends hardware readings (Hardware.cs) while the board shows its
+// hardware page. Run elevated for temperatures and power.
+//
 // Usage: NowPlayingBridge.exe [--port COM5] [--spotify-only] [--debug]
+//        NowPlayingBridge.exe --list-sensors
 
 using System.IO.Ports;
 using System.Runtime.InteropServices;
@@ -25,18 +29,45 @@ static class Program
     [DllImport("kernel32.dll")]
     static extern bool AllocConsole();
 
+    [DllImport("kernel32.dll")]
+    static extern bool AttachConsole(int processId);
+
+    /// WinExe has no console: reuse the terminal it was started from, or open one.
+    /// Returns true when a new window was opened.
+    static bool OpenConsole()
+    {
+        if (AttachConsole(-1)) return false; // ATTACH_PARENT_PROCESS
+        AllocConsole();
+        return true;
+    }
+
     static async Task<int> Main(string[] args)
     {
         string? port = null;
-        bool spotifyOnly = false;
+        bool spotifyOnly = false, listSensors = false;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i].ToLowerInvariant())
             {
-                case "--debug": AllocConsole(); Log.Enabled = true; break;
+                case "--debug": OpenConsole(); Log.Enabled = true; break;
                 case "--port" when i + 1 < args.Length: port = args[++i]; break;
                 case "--spotify-only": spotifyOnly = true; break;
+                case "--list-sensors": listSensors = true; break;
             }
+        }
+
+        var overrides = HardwareMonitor.LoadOverrides(Path.Combine(AppContext.BaseDirectory, "sensors.ini"));
+        if (listSensors)
+        {
+            bool newWindow = OpenConsole();
+            Log.Enabled = true;
+            Console.WriteLine();
+            if (!HardwareMonitor.IsElevated())
+                Console.WriteLine("Note: not running as administrator, most sensors will be missing.\n");
+            using (var hw = new HardwareMonitor(overrides))
+                hw.PrintAll(Console.Out);
+            if (newWindow) { Console.WriteLine("\nPress Enter to close."); Console.ReadLine(); }
+            return 0;
         }
 
         using var mutex = new Mutex(true, @"Local\NowPlayingBridge", out bool firstInstance);
@@ -46,7 +77,7 @@ static class Program
             return 1;
         }
 
-        await new Bridge(port, spotifyOnly).RunAsync();
+        await new Bridge(port, spotifyOnly, new HardwareMonitor(overrides)).RunAsync();
         return 0;
     }
 }
@@ -64,7 +95,9 @@ static class Log
 static class Proto
 {
     public const byte Sync0 = 0xA5, Sync1 = 0x5A;
-    public const byte Hello = 0x01, State = 0x02, Art = 0x03, ArtNone = 0x04, Cmd = 0x10;
+    public const byte Hello = 0x01, State = 0x02, Art = 0x03, ArtNone = 0x04, Hw = 0x05, HwTemps = 0x06,
+                      Cmd = 0x10, Page = 0x11;
+    public const byte PageMedia = 0, PageHw = 1;
     public const byte CmdPlayPause = 1, CmdNext = 2, CmdPrev = 3;
     public const byte FlagSession = 0x01, FlagPlaying = 0x02;
     public const int ArtW = 150, ArtH = 150, ArtBytes = ArtW * ArtH * 2;
@@ -223,6 +256,8 @@ sealed class Bridge
 {
     readonly string? _fixedPort;
     readonly bool _spotifyOnly;
+    readonly HardwareMonitor _hw;
+    volatile bool _hwWanted; // board is showing the hardware page
     readonly SemaphoreSlim _wake = new(0, 1);
 
     SessionManager _mgr = null!;
@@ -239,10 +274,11 @@ sealed class Bridge
     int _artAttempts;
     uint _sentArtId = uint.MaxValue;
 
-    public Bridge(string? port, bool spotifyOnly)
+    public Bridge(string? port, bool spotifyOnly, HardwareMonitor hw)
     {
         _fixedPort = port;
         _spotifyOnly = spotifyOnly;
+        _hw = hw;
     }
 
     void Wake()
@@ -255,6 +291,7 @@ sealed class Bridge
         _mgr = await SessionManager.RequestAsync();
         _mgr.SessionsChanged += (_, _) => { _sessionsChanged = true; Wake(); };
         _mgr.CurrentSessionChanged += (_, _) => { _sessionsChanged = true; Wake(); };
+        _ = Task.Run(HardwareLoopAsync);
 
         while (true)
         {
@@ -263,6 +300,7 @@ sealed class Bridge
                 if (_link is null || _link.Dead)
                 {
                     _link?.Dispose();
+                    _hwWanted = false; // the board re-announces its page after HELLO
                     _link = await ConnectAsync();
                     if (_link is null)
                     {
@@ -271,7 +309,7 @@ sealed class Bridge
                     }
                     _needFull = true;
                 }
-                SelectSession();
+                await SelectSessionAsync();
                 await PushAsync(_link);
             }
             catch (Exception e)
@@ -291,6 +329,7 @@ sealed class Bridge
             if (link is null) continue;
             Log.Write($"Connected to the display on {name}");
             link.FrameReceived += OnFrame;
+            link.Send(Proto.Hello, Proto.HelloPayload); // board answers with HELLO + its current page
             return link;
         }
         return null;
@@ -303,6 +342,10 @@ sealed class Bridge
             case Proto.Hello: // board (re)booted or lost sync: resend everything
                 _needFull = true;
                 Wake();
+                break;
+            case Proto.Page when payload.Length == 1:
+                _hwWanted = payload[0] == Proto.PageHw;
+                Log.Write($"board page: {(_hwWanted ? "hardware" : "media")}");
                 break;
             case Proto.Cmd when payload.Length == 1:
                 _ = RunCommandAsync(payload[0]);
@@ -334,16 +377,95 @@ sealed class Bridge
         await Task.Delay(500); Wake();
     }
 
+    // ------------------------------------------------------------ hardware --
+    /// Once a second, while the board shows the hardware page. Sensor reads run
+    /// on this task only; the serial write is shared with the media loop (locked).
+    async Task HardwareLoopAsync()
+    {
+        while (true)
+        {
+            var link = _link;
+            if (_hwWanted && link is not null && !link.Dead)
+            {
+                var (data, temps) = _hw.Sample();
+                var payload = new byte[1 + data.Count * 5];
+                payload[0] = (byte)data.Count;
+                for (int i = 0; i < data.Count; i++)
+                {
+                    payload[1 + i * 5] = (byte)data[i].Item1;
+                    BitConverter.TryWriteBytes(payload.AsSpan(2 + i * 5, 4), data[i].Item2);
+                }
+                link.Send(Proto.Hw, payload);
+
+                // Labelled temperatures for the bottom row (always sent, even empty)
+                var t = new List<byte> { (byte)Math.Min(temps.Count, HardwareMonitor.MaxTemps) };
+                foreach (var (label, value) in temps.Take(HardwareMonitor.MaxTemps))
+                {
+                    var lb = Encoding.UTF8.GetBytes(label);
+                    t.Add((byte)lb.Length);
+                    t.AddRange(lb);
+                    t.AddRange(BitConverter.GetBytes(value));
+                }
+                link.Send(Proto.HwTemps, t.ToArray());
+            }
+            await Task.Delay(1000);
+        }
+    }
+
     // ------------------------------------------------------------ sessions --
-    void SelectSession()
+    static bool IsSpotify(Session s) =>
+        s.SourceAppUserModelId.Contains("Spotify", StringComparison.OrdinalIgnoreCase);
+
+    static PlaybackStatus StatusOf(Session s)
+    {
+        try { return s.GetPlaybackInfo()?.PlaybackStatus ?? PlaybackStatus.Closed; }
+        catch { return PlaybackStatus.Closed; }
+    }
+
+    /// Has a track loaded (title) and is playing or paused on it.
+    static async Task<bool> HasMediaAsync(Session s)
+    {
+        if (StatusOf(s) is not (PlaybackStatus.Playing or PlaybackStatus.Paused or PlaybackStatus.Changing))
+            return false;
+        try
+        {
+            var props = await s.TryGetMediaPropertiesAsync();
+            return !string.IsNullOrEmpty(props?.Title);
+        }
+        catch { return false; }
+    }
+
+    /// Which app to show, in order:
+    ///  1. something actually playing (Windows' current session, i.e. what its
+    ///     own media flyout shows, usually the last one started; then the one
+    ///     already shown; then Spotify; then any other);
+    ///  2. otherwise something paused with a track loaded (the one already shown,
+    ///     then Windows' current session, then Spotify, then any other), so a paused
+    ///     video stays on screen instead of an idle Spotify taking over;
+    ///  3. otherwise nothing ("Nothing is playing").
+    /// --spotify-only restricts all of this to Spotify.
+    async Task SelectSessionAsync()
     {
         Session? pick = null;
         try
         {
-            pick = _mgr.GetSessions().FirstOrDefault(s =>
-                s.SourceAppUserModelId.Contains("Spotify", StringComparison.OrdinalIgnoreCase));
-            if (pick is null && !_spotifyOnly)
-                pick = _mgr.GetCurrentSession();
+            var sessions = _mgr.GetSessions().Where(s => !_spotifyOnly || IsSpotify(s)).ToList();
+            string currentId = "";
+            try { currentId = _mgr.GetCurrentSession()?.SourceAppUserModelId ?? ""; } catch { }
+
+            var withMedia = new List<Session>();
+            foreach (var s in sessions)
+                if (await HasMediaAsync(s)) withMedia.Add(s);
+            var playing = withMedia.Where(s => StatusOf(s) == PlaybackStatus.Playing).ToList();
+
+            pick = playing.FirstOrDefault(s => s.SourceAppUserModelId == currentId)
+                   ?? playing.FirstOrDefault(s => s.SourceAppUserModelId == _sessionId)
+                   ?? playing.FirstOrDefault(IsSpotify)
+                   ?? playing.FirstOrDefault()
+                   ?? withMedia.FirstOrDefault(s => s.SourceAppUserModelId == _sessionId)
+                   ?? withMedia.FirstOrDefault(s => s.SourceAppUserModelId == currentId)
+                   ?? withMedia.FirstOrDefault(IsSpotify)
+                   ?? withMedia.FirstOrDefault();
         }
         catch (Exception e)
         {
@@ -407,7 +529,11 @@ sealed class Bridge
                 playing = status == PlaybackStatus.Playing;
                 has = title.Length > 0 && status is PlaybackStatus.Playing or PlaybackStatus.Paused or PlaybackStatus.Changing;
 
-                if (tl is not null)
+                // An empty timeline (no duration) means "position unknown": browsers
+                // publish one when a video loads or changes (Chromium's ClearPosition)
+                // and only send a real one on the next play/pause/seek. Send 0/0 and let
+                // the board hide the time, rather than extrapolating a fake counter.
+                if (tl is not null && tl.EndTime - tl.StartTime > TimeSpan.Zero)
                 {
                     var dur = tl.EndTime - tl.StartTime;
                     var pos = tl.Position - tl.StartTime;

@@ -15,7 +15,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+    <!-- 10.0.3: LibreHardwareMonitorLib 0.9.6 requires at least this version -->
+    <PackageReference Include="System.IO.Ports" Version="10.0.3" />
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
   </ItemGroup>
 
 </Project>

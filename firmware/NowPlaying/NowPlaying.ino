@@ -9,6 +9,7 @@
 // so the shared state below needs no locking.
 
 #include <Arduino.h>
+#include <math.h>
 #include <esp_heap_caps.h>
 #include <Preferences.h>
 #include "soc/usb_serial_jtag_reg.h"
@@ -19,6 +20,7 @@ LV_FONT_DECLARE(font_latin_14);
 LV_FONT_DECLARE(font_latin_16);
 LV_FONT_DECLARE(font_latin_22);
 LV_FONT_DECLARE(font_icons_48);
+LV_FONT_DECLARE(font_num_34);
 
 #define ICON_MUSIC "\xEF\x80\x81" // U+F001, same code points as LV_SYMBOL_*
 #define ICON_PLAY LV_SYMBOL_PLAY  // U+F04B
@@ -42,6 +44,21 @@ static const uint8_t BRIGHT_DIM = 10;
 static const uint32_t COL_GREEN = 0x1DB954;
 static const uint32_t COL_TRACK = 0x202020;
 static const uint32_t COL_GREY = 0xA0A0A0;
+static const uint32_t COL_RAM_BAR = 0x4FC3F7;  // hardware page bars
+static const uint32_t COL_VRAM_BAR = 0x9C6BFF;
+static const uint32_t COL_ARC_FROM = 0x3D5AFE; // load arc gradient
+static const uint32_t COL_ARC_TO = 0xFF2E93;
+// Value colour scale for text: cool blue -> violet -> red-pink
+static const uint32_t COL_SCALE_LO = 0x4FA8FF;
+static const uint32_t COL_SCALE_MID = 0x9C6BFF;
+static const uint32_t COL_SCALE_HI = 0xFF3D6E;
+// Ranges mapped onto that scale (below = blue, above = red-pink)
+static const float SCALE_CPU_GPU_TEMP[2] = {30, 90};  // °C
+static const float SCALE_OTHER_TEMP[2] = {25, 75};    // °C, RAM modules / SSD
+static const float SCALE_CPU_CLOCK[2] = {1000, 5500}; // MHz
+static const float SCALE_GPU_CLOCK[2] = {200, 3000};  // MHz
+static const uint32_t HW_STALE_MS = 3000;
+static const uint32_t PAGE_ANIM_MS = 250;
 
 // ---------------------------------------------------------- shared state --
 struct NowPlaying
@@ -81,6 +98,18 @@ static Preferences prefs;
 static uint8_t bright_full = BRIGHT_DEFAULT;
 static lv_obj_t *dlg_backdrop = nullptr, *dlg_slider, *dlg_value;
 
+// Pages and hardware data
+static uint8_t page = PAGE_MEDIA;
+static lv_obj_t *scr_hw;
+static float hw_val[HW_COUNT];
+static uint32_t hw_has = 0;   // bit per metric present in the last frame
+static uint8_t hw_temp_count = 0; // labelled extra temperatures (bottom row)
+static char hw_temp_label[HW_TEMPS_MAX][HW_TEMP_LABEL_MAX + 1];
+static float hw_temp_val[HW_TEMPS_MAX];
+static uint32_t hw_stamp = 0; // millis() of the last frame
+static bool hw_dirty = true, hw_stale_shown = false;
+static void on_gesture(lv_event_t *e);
+
 // PC presence
 static lv_obj_t *scr_main, *scr_off;
 static bool pc_off = false;
@@ -104,9 +133,12 @@ static void send_frame(uint8_t type, const uint8_t *payload, uint32_t len)
   Serial.write(&sum, 1);
 }
 
+static void send_page() { send_frame(MSG_PAGE, &page, 1); }
+
 static void send_hello()
 {
   send_frame(MSG_HELLO, (const uint8_t *)"NPR1", 4);
+  send_page(); // tells the PC whether to collect hardware data
   last_hello_ms = millis();
 }
 
@@ -194,6 +226,49 @@ static void handle_frame(uint8_t type, const uint8_t *p, uint32_t len)
       now.shown_art_id = rd32(p);
       now.has_art = true;
       now.art_dirty = true;
+    }
+    break;
+  case MSG_HW:
+    if (len >= 1 && len >= 1u + p[0] * 5u)
+    {
+      uint32_t has = 0;
+      for (int i = 0; i < p[0]; i++)
+      {
+        const uint8_t *e = p + 1 + i * 5;
+        if (e[0] >= HW_COUNT)
+          continue; // newer PC software: ignore unknown metrics
+        float v;
+        memcpy(&v, e + 1, 4);
+        hw_val[e[0]] = v;
+        has |= 1u << e[0];
+      }
+      hw_has = has;
+      hw_stamp = millis();
+      hw_dirty = true;
+    }
+    break;
+  case MSG_HW_TEMPS:
+    if (len >= 1)
+    {
+      uint32_t off = 1;
+      uint8_t n = 0;
+      for (int i = 0; i < p[0] && n < HW_TEMPS_MAX; i++)
+      {
+        if (off + 1 > len)
+          break;
+        uint8_t l = p[off++];
+        if (off + l + 4 > len)
+          break;
+        uint8_t keep = l > HW_TEMP_LABEL_MAX ? HW_TEMP_LABEL_MAX : l;
+        memcpy(hw_temp_label[n], p + off, keep);
+        hw_temp_label[n][keep] = 0;
+        off += l;
+        memcpy(&hw_temp_val[n], p + off, 4);
+        off += 4;
+        n++;
+      }
+      hw_temp_count = n;
+      hw_dirty = true;
     }
     break;
   case MSG_ART_NONE:
@@ -346,6 +421,7 @@ static void load_brightness()
 {
   prefs.begin("npr", true); // read-only
   bright_full = clamp_brightness(prefs.getUChar("bright", BRIGHT_DEFAULT));
+  page = prefs.getUChar("page", PAGE_MEDIA) == PAGE_HW ? PAGE_HW : PAGE_MEDIA;
   prefs.end();
 }
 
@@ -487,6 +563,7 @@ static void build_ui()
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(scr, on_gesture, LV_EVENT_GESTURE, NULL);
 
   // Progress arc on the rim
   arc = lv_arc_create(scr);
@@ -572,6 +649,318 @@ static void build_ui()
   lv_obj_set_style_text_color(off, lv_color_hex(COL_GREY), 0);
   lv_label_set_text(off, "PC is off");
   lv_obj_center(off);
+}
+
+// ========================================================= hardware page ==
+// Layout v2: memory bars at the top, CPU and GPU load gauges side by side,
+// labelled temperatures (RAM modules, SSD...) along the bottom.
+static lv_obj_t *hw_cpu_arc, *hw_cpu_temp, *hw_cpu_load, *hw_cpu_clock, *hw_cpu_power;
+static lv_obj_t *hw_gpu_arc, *hw_gpu_temp, *hw_gpu_load, *hw_gpu_clock, *hw_gpu_power;
+static lv_obj_t *hw_ram_val, *hw_ram_bar, *hw_vram_val, *hw_vram_bar;
+static lv_obj_t *hw_extra_name[HW_TEMPS_MAX], *hw_extra_val[HW_TEMPS_MAX];
+static lv_img_dsc_t arc_grad_dsc;
+
+static const lv_coord_t GAUGE = 140;  // load arc diameter
+static const lv_coord_t GAUGE_W = 10; // arc width
+static const lv_coord_t GAUGE_CY = 192, GAUGE_DX = 98; // centres at 180 +/- 98
+
+static void set_page(uint8_t p, bool animate);
+
+static void on_gesture(lv_event_t *e)
+{
+  if (dlg_backdrop)
+    return;
+  lv_indev_t *indev = lv_indev_get_act();
+  lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+  if (dir == LV_DIR_TOP && page == PAGE_MEDIA)
+    set_page(PAGE_HW, true);
+  else if (dir == LV_DIR_BOTTOM && page == PAGE_HW)
+    set_page(PAGE_MEDIA, true);
+  else
+    return;
+  lv_indev_wait_release(indev); // the swipe must not also click what it started on
+}
+
+static void set_page(uint8_t p, bool animate)
+{
+  if (p == page)
+    return;
+  page = p;
+  show(tap_disc, false);
+  tap_until = 0;
+  hw_dirty = true;
+  lv_scr_load_anim(p == PAGE_HW ? scr_hw : scr_main,
+                   p == PAGE_HW ? LV_SCR_LOAD_ANIM_MOVE_TOP : LV_SCR_LOAD_ANIM_MOVE_BOTTOM,
+                   animate ? PAGE_ANIM_MS : 0, 0, false);
+  prefs.begin("npr", false);
+  prefs.putUChar("page", p);
+  prefs.end();
+  send_page();
+  if (dimmed) // the hardware page is never dimmed
+  {
+    set_brightness(bright_full);
+    dimmed = false;
+  }
+}
+
+// Conic gradient (blue -> pink along the 270 degree sweep), used as the
+// texture of the temperature arcs' indicator. Shared by both gauges.
+static void make_arc_gradient()
+{
+  uint16_t *px = (uint16_t *)heap_caps_malloc(GAUGE * GAUGE * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!px)
+    return;
+  lv_color_t a = lv_color_hex(COL_ARC_FROM), b = lv_color_hex(COL_ARC_TO);
+  float c = (GAUGE - 1) / 2.0f;
+  for (int y = 0; y < GAUGE; y++)
+    for (int x = 0; x < GAUGE; x++)
+    {
+      float deg = atan2f(y - c, x - c) * 57.29578f; // 0 = 3 o'clock, clockwise
+      float along = fmodf(deg - 135.0f + 720.0f, 360.0f) / 270.0f;
+      if (along > 1) // in the bottom gap (rounded end caps): nearest end's colour
+        along = along < 1.1667f ? 1 : 0;
+      lv_color_t col = lv_color_mix(b, a, (uint8_t)(along * 255));
+      px[y * GAUGE + x] = col.full;
+    }
+  memset(&arc_grad_dsc, 0, sizeof arc_grad_dsc);
+  arc_grad_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+  arc_grad_dsc.header.w = GAUGE;
+  arc_grad_dsc.header.h = GAUGE;
+  arc_grad_dsc.data_size = GAUGE * GAUGE * 2;
+  arc_grad_dsc.data = (const uint8_t *)px;
+}
+
+static lv_obj_t *hw_label(lv_obj_t *parent, const lv_font_t *font, uint32_t color, const char *text,
+                          lv_align_t align, lv_coord_t x, lv_coord_t y)
+{
+  lv_obj_t *l = lv_label_create(parent);
+  lv_obj_set_style_text_font(l, font, 0);
+  lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
+  lv_label_set_text(l, text);
+  lv_obj_align(l, align, x, y);
+  return l;
+}
+
+/// Value -> cool blue / violet / red-pink, linear between lo and hi.
+static lv_color_t scale_color(float v, float lo, float hi)
+{
+  float t = hi > lo ? (v - lo) / (hi - lo) : 0;
+  t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  if (t < 0.5f)
+    return lv_color_mix(lv_color_hex(COL_SCALE_MID), lv_color_hex(COL_SCALE_LO), (uint8_t)(t * 2 * 255));
+  return lv_color_mix(lv_color_hex(COL_SCALE_HI), lv_color_hex(COL_SCALE_MID), (uint8_t)((t - 0.5f) * 2 * 255));
+}
+
+static void set_color(lv_obj_t *l, lv_color_t c) { lv_obj_set_style_text_color(l, c, 0); }
+
+// One load gauge: arc (0-100 %), caption, temperature, load; clock and
+// power just below the arc's open ends. cx = horizontal offset from centre.
+static void hw_gauge(lv_obj_t *scr, lv_coord_t cx, const char *name, lv_obj_t **arc, lv_obj_t **temp,
+                     lv_obj_t **load, lv_obj_t **clock, lv_obj_t **power)
+{
+  lv_obj_t *a = lv_arc_create(scr);
+  lv_obj_set_size(a, GAUGE, GAUGE);
+  lv_obj_align(a, LV_ALIGN_TOP_MID, cx, GAUGE_CY - GAUGE / 2);
+  lv_arc_set_rotation(a, 0);
+  lv_arc_set_bg_angles(a, 135, 45); // 270 degree sweep, open at the bottom
+  lv_arc_set_range(a, 0, 100);
+  lv_arc_set_value(a, 0);
+  lv_obj_remove_style(a, NULL, LV_PART_KNOB);
+  lv_obj_clear_flag(a, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_pad_all(a, 0, 0);
+  lv_obj_set_style_arc_width(a, GAUGE_W, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(a, GAUGE_W, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(a, lv_color_hex(COL_TRACK), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(a, lv_color_hex(COL_ARC_FROM), LV_PART_INDICATOR); // fallback
+  if (arc_grad_dsc.data)
+    lv_obj_set_style_arc_img_src(a, &arc_grad_dsc, LV_PART_INDICATOR);
+  *arc = a;
+
+  lv_coord_t top = GAUGE_CY - GAUGE / 2;
+  char caption[24];
+  snprintf(caption, sizeof caption, "%s TEMP", name);
+  hw_label(scr, &font_latin_14, COL_GREY, caption, LV_ALIGN_TOP_MID, cx, top + 26);
+  *temp = hw_label(scr, &font_num_34, COL_SCALE_LO, "--", LV_ALIGN_TOP_MID, cx, top + 44);
+  *load = hw_label(scr, &font_latin_14, 0xFFFFFF, "LOAD --", LV_ALIGN_TOP_MID, cx, top + 88);
+
+  // shifted towards the screen centre so the round edge never clips them
+  lv_coord_t below = top + GAUGE - 10;
+  lv_coord_t shift = cx < 0 ? 8 : -6;
+  *clock = hw_label(scr, &font_latin_14, COL_SCALE_LO, "--", LV_ALIGN_TOP_MID, cx - 32 + shift, below);
+  *power = hw_label(scr, &font_latin_14, 0xFFFFFF, "--", LV_ALIGN_TOP_MID, cx + 32 + shift, below);
+}
+
+static lv_obj_t *hw_bar(lv_obj_t *scr, lv_coord_t y, uint32_t color)
+{
+  lv_obj_t *b = lv_bar_create(scr);
+  lv_obj_set_size(b, 124, 5);
+  lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
+  lv_bar_set_range(b, 0, 100);
+  lv_obj_set_style_radius(b, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(b, 2, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(b, lv_color_hex(COL_TRACK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(b, lv_color_hex(color), LV_PART_INDICATOR);
+  return b;
+}
+
+static void build_hw_ui()
+{
+  make_arc_gradient();
+  scr_hw = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(scr_hw, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(scr_hw, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(scr_hw, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(scr_hw, on_gesture, LV_EVENT_GESTURE, NULL);
+
+  // Memory at the top
+  hw_label(scr_hw, &font_latin_14, COL_GREY, "GPU MEMORY", LV_ALIGN_TOP_MID, 0, 14);
+  hw_vram_val = hw_label(scr_hw, &font_latin_22, COL_SCALE_LO, "--", LV_ALIGN_TOP_MID, 0, 30);
+  hw_vram_bar = hw_bar(scr_hw, 58, COL_VRAM_BAR);
+  hw_label(scr_hw, &font_latin_14, COL_GREY, "RAM USED", LV_ALIGN_TOP_MID, 0, 70);
+  hw_ram_val = hw_label(scr_hw, &font_latin_22, COL_SCALE_LO, "--", LV_ALIGN_TOP_MID, 0, 86);
+  hw_ram_bar = hw_bar(scr_hw, 114, COL_RAM_BAR);
+
+  // Load gauges side by side
+  hw_gauge(scr_hw, -GAUGE_DX, "CPU", &hw_cpu_arc, &hw_cpu_temp, &hw_cpu_load, &hw_cpu_clock, &hw_cpu_power);
+  hw_gauge(scr_hw, GAUGE_DX, "GPU", &hw_gpu_arc, &hw_gpu_temp, &hw_gpu_load, &hw_gpu_clock, &hw_gpu_power);
+
+  // Labelled temperatures along the bottom (positions set when data arrives)
+  for (int i = 0; i < HW_TEMPS_MAX; i++)
+  {
+    hw_extra_name[i] = hw_label(scr_hw, &font_latin_14, 0x707070, "", LV_ALIGN_TOP_MID, 0, 282);
+    hw_extra_val[i] = hw_label(scr_hw, &font_latin_16, COL_SCALE_LO, "", LV_ALIGN_TOP_MID, 0, 299);
+  }
+}
+
+static bool hw_get(uint8_t id, float *v)
+{
+  if (!(hw_has & (1u << id)))
+    return false;
+  *v = hw_val[id];
+  return true;
+}
+
+static void hw_text(lv_obj_t *l, uint8_t id, const char *fmt, float scale = 1.0f)
+{
+  float v;
+  char buf[32];
+  if (hw_get(id, &v))
+    snprintf(buf, sizeof buf, fmt, v * scale);
+  else
+    strcpy(buf, "--");
+  lv_label_set_text(l, buf);
+}
+
+static void fmt_temp(char *buf, size_t n, float v)
+{
+  snprintf(buf, n, "%d\xC2\xB0" "C", (int)lroundf(v));
+}
+
+static void hw_gauge_update(lv_obj_t *arc, lv_obj_t *temp, lv_obj_t *load, lv_obj_t *clock, lv_obj_t *power,
+                            uint8_t id_temp, uint8_t id_load, uint8_t id_clock, uint8_t id_power,
+                            const float clock_scale[2])
+{
+  float v;
+  char buf[24];
+  if (hw_get(id_temp, &v))
+  {
+    fmt_temp(buf, sizeof buf, v);
+    lv_label_set_text(temp, buf);
+    set_color(temp, scale_color(v, SCALE_CPU_GPU_TEMP[0], SCALE_CPU_GPU_TEMP[1]));
+  }
+  else
+    lv_label_set_text(temp, "--");
+
+  if (hw_get(id_load, &v))
+  {
+    int pct = (int)lroundf(v);
+    pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    snprintf(buf, sizeof buf, "LOAD %d%%", pct);
+    lv_label_set_text(load, buf);
+    lv_arc_set_value(arc, pct);
+  }
+  else
+  {
+    lv_label_set_text(load, "LOAD --");
+    lv_arc_set_value(arc, 0);
+  }
+
+  if (hw_get(id_clock, &v))
+  {
+    snprintf(buf, sizeof buf, "%.2f GHz", v / 1000);
+    lv_label_set_text(clock, buf);
+    set_color(clock, scale_color(v, clock_scale[0], clock_scale[1]));
+  }
+  else
+    lv_label_set_text(clock, "--");
+
+  hw_text(power, id_power, "%.1f W");
+}
+
+static void hw_memory(lv_obj_t *val, lv_obj_t *bar, uint8_t used_id, uint8_t total_id)
+{
+  float used, total;
+  char buf[32];
+  if (!hw_get(used_id, &used))
+  {
+    lv_label_set_text(val, "--");
+    lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+    return;
+  }
+  bool has_total = hw_get(total_id, &total) && total > 0;
+  if (has_total)
+    snprintf(buf, sizeof buf, "%.1f / %.0f GB", used, total);
+  else
+    snprintf(buf, sizeof buf, "%.1f GB", used);
+  lv_label_set_text(val, buf);
+  set_color(val, scale_color(has_total ? used / total : 0, 0, 1));
+  lv_bar_set_value(bar, has_total ? (int32_t)lroundf(used * 100 / total) : 0, LV_ANIM_OFF);
+}
+
+static void hw_extras_update()
+{
+  static const lv_coord_t pos[HW_TEMPS_MAX + 1][HW_TEMPS_MAX] = {
+      {0, 0, 0}, {0, 0, 0}, {-40, 40, 0}, {-76, 0, 76}};
+  uint8_t n = hw_temp_count;
+  for (int i = 0; i < HW_TEMPS_MAX; i++)
+  {
+    bool on = i < n;
+    show(hw_extra_name[i], on);
+    show(hw_extra_val[i], on);
+    if (!on)
+      continue;
+    char buf[16];
+    fmt_temp(buf, sizeof buf, hw_temp_val[i]);
+    lv_label_set_text(hw_extra_name[i], hw_temp_label[i]);
+    lv_label_set_text(hw_extra_val[i], buf);
+    set_color(hw_extra_val[i], scale_color(hw_temp_val[i], SCALE_OTHER_TEMP[0], SCALE_OTHER_TEMP[1]));
+    lv_obj_align(hw_extra_name[i], LV_ALIGN_TOP_MID, pos[n][i], 282);
+    lv_obj_align(hw_extra_val[i], LV_ALIGN_TOP_MID, pos[n][i], 299);
+  }
+}
+
+static void hw_refresh(uint32_t t)
+{
+  bool stale = !now.link || t - hw_stamp > HW_STALE_MS;
+  if (stale && !hw_stale_shown)
+  {
+    hw_has = 0; // show "--" everywhere until fresh data arrives
+    hw_temp_count = 0;
+    hw_dirty = true;
+  }
+  hw_stale_shown = stale;
+  if (!hw_dirty)
+    return;
+  hw_dirty = false;
+
+  hw_memory(hw_vram_val, hw_vram_bar, HW_VRAM_USED, HW_VRAM_TOTAL);
+  hw_memory(hw_ram_val, hw_ram_bar, HW_RAM_USED, HW_RAM_TOTAL);
+  hw_gauge_update(hw_cpu_arc, hw_cpu_temp, hw_cpu_load, hw_cpu_clock, hw_cpu_power,
+                  HW_CPU_TEMP, HW_CPU_LOAD, HW_CPU_CLOCK, HW_CPU_POWER, SCALE_CPU_CLOCK);
+  hw_gauge_update(hw_gpu_arc, hw_gpu_temp, hw_gpu_load, hw_gpu_clock, hw_gpu_power,
+                  HW_GPU_TEMP, HW_GPU_LOAD, HW_GPU_CLOCK, HW_GPU_POWER, SCALE_GPU_CLOCK);
+  hw_extras_update();
 }
 
 static void apply_idle(bool idle)
@@ -661,7 +1050,7 @@ static void ui_tick(lv_timer_t *)
       if (ds > 0)
         snprintf(buf, sizeof buf, "%s / %s", a1, a2);
       else
-        snprintf(buf, sizeof buf, "%s", a1); // player reports no duration
+        buf[0] = 0; // position unknown (e.g. a browser that hasn't sent its timeline yet)
       lv_label_set_text(lbl_time, buf);
       shown_sec = s;
       shown_dur_sec = ds;
@@ -673,9 +1062,12 @@ static void ui_tick(lv_timer_t *)
     shown_arc = 0;
   }
 
+  if (page == PAGE_HW)
+    hw_refresh(t);
+
   // Long press on the artwork opens the brightness dialog
   static uint32_t art_press_start = 0;
-  if (!ui_idle && !dlg_backdrop && lv_obj_has_state(art_box, LV_STATE_PRESSED))
+  if (page == PAGE_MEDIA && !ui_idle && !dlg_backdrop && lv_obj_has_state(art_box, LV_STATE_PRESSED))
   {
     if (!art_press_start)
       art_press_start = t;
@@ -701,7 +1093,7 @@ static void ui_tick(lv_timer_t *)
     idle_since = 0;
   else if (!idle_since)
     idle_since = t;
-  bool dim = idle && !dlg_backdrop && t - idle_since >= DIM_AFTER_MS &&
+  bool dim = idle && page == PAGE_MEDIA && !dlg_backdrop && t - idle_since >= DIM_AFTER_MS &&
              lv_disp_get_inactive_time(NULL) >= DIM_AFTER_MS;
   if (dim != dimmed)
   {
@@ -762,7 +1154,8 @@ static void leave_pc_off()
   peek_until = 0;
   now.link = false; // anything we knew is stale; the bridge resends on HELLO
   now.session = false;
-  lv_scr_load(scr_main);
+  lv_scr_load(page == PAGE_HW ? scr_hw : scr_main);
+  hw_dirty = true;
   ui_first = true; // re-apply the idle/playing layout on the next tick
   dimmed = false;
   screen_switch(true);
@@ -815,6 +1208,9 @@ void setup()
   scr_lvgl_init();   // vendor init switches the backlight on at 100 %
   set_brightness(bright_full);
   build_ui();
+  build_hw_ui();
+  if (page == PAGE_HW)
+    lv_scr_load(scr_hw);
   lv_timer_create(ui_tick, 100, NULL);
   ui_tick(NULL);
   send_hello();

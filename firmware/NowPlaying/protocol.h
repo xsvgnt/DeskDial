@@ -11,10 +11,17 @@
 //   MSG_STATE     flags u8 (bit0 session, bit1 playing), position_ms u32,
 //                 duration_ms u32, art_id u32,
 //                 title_len u8, title UTF-8, artist_len u8, artist UTF-8
+//   MSG_HW        count u8, then count x (metric id u8, value float32 LE);
+//                 metrics the PC can't read are simply absent. Sent once a
+//                 second, only while the board shows the hardware page.
+//   MSG_HW_TEMPS  count u8, then count x (label_len u8, label UTF-8,
+//                 value float32 LE): extra labelled temperatures (RAM
+//                 modules, SSD...), sent right after MSG_HW. Max HW_TEMPS_MAX.
 // ESP32 -> PC
 //   MSG_HELLO     "NPR1"                     at boot, every 2 s while unlinked,
 //                                            and in reply to the PC's HELLO
 //   MSG_CMD       command u8
+//   MSG_PAGE      page u8 (PAGE_*), after every HELLO and on each change
 #pragma once
 #include <stdint.h>
 
@@ -33,8 +40,44 @@ enum : uint8_t
   MSG_STATE = 0x02,
   MSG_ART = 0x03,
   MSG_ART_NONE = 0x04,
+  MSG_HW = 0x05,
+  MSG_HW_TEMPS = 0x06,
   MSG_CMD = 0x10,
+  MSG_PAGE = 0x11,
 };
+
+enum : uint8_t
+{
+  PAGE_MEDIA = 0,
+  PAGE_HW = 1,
+};
+
+// Hardware metrics. Units: temperatures °C, loads %, clocks MHz, power W,
+// fans RPM, memory and disk GB. New ids can be added without breaking
+// older firmware (unknown ids are ignored).
+enum : uint8_t
+{
+  HW_CPU_TEMP = 1,
+  HW_CPU_LOAD = 2,
+  HW_CPU_CLOCK = 3,
+  HW_CPU_POWER = 4,
+  HW_CPU_FAN = 5,     // not displayed (layout v2), no longer sent
+  HW_RAM_USED = 6,
+  HW_RAM_TOTAL = 7,
+  HW_GPU_TEMP = 8,
+  HW_GPU_LOAD = 9,
+  HW_GPU_CLOCK = 10,
+  HW_GPU_POWER = 11,
+  HW_GPU_FAN = 12,    // not displayed (layout v2), no longer sent
+  HW_VRAM_USED = 13,
+  HW_VRAM_TOTAL = 14,
+  HW_DISK_USED = 15,  // system drive, not shown yet
+  HW_DISK_TOTAL = 16,
+  HW_COUNT = 17,
+};
+
+#define HW_TEMPS_MAX 3
+#define HW_TEMP_LABEL_MAX 11 // bytes, UTF-8
 
 enum : uint8_t
 {
