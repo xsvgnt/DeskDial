@@ -1,102 +1,126 @@
-# ESP32 Media Remote
+# DeskDial
 
-Shows what Spotify is playing on the JC3636W518 round display (ESP32-S3) and lets you
-play/pause, skip and go back from the screen. Swipe up for a second page with the PC's
-loads, temperatures, clocks, power and memory. The board talks to a small Windows program
-over the USB-C cable that already powers it. No Home Assistant, Wi-Fi or cloud needed.
+A round desk display for your PC. DeskDial shows what Windows is playing, with the
+artwork and play/pause, next and previous controls. Swipe up for a second page with
+your PC's loads, temperatures, clocks, power and memory. It runs on the JC3636W518
+board (ESP32-S3 with a 360×360 round touch screen), and a small Windows companion
+feeds it over the USB-C cable that already powers it. It needs no Wi-Fi, no cloud and
+no Home Assistant.
 
 ```
-Spotify ─► Windows media controls ─► NowPlayingBridge.exe ══USB serial══► ESP32-S3
-                                    ◄──── play/pause, next, prev ─────────
+Spotify, browsers, VLC… ─► Windows media controls ─┐
+                                                   ├─► DeskDial.exe ══USB══► board
+CPU / GPU / RAM / SSD sensors ─────────────────────┘ ◄── play/pause, next, prev
 ```
 
-![UI preview](docs/ui-preview.png)
+<p>
+<img src="docs/ui-preview.png" width="280" alt="Now playing page">
+<img src="docs/hardware-page.png" width="280" alt="Hardware page">
+</p>
 
-![Hardware page](docs/hardware-page.png)
+Both halves are modular. Build the media page, the hardware page, or both. A board and
+a companion built with different modules agree on what they have in common.
 
-## Folder layout
+| Build | Board shows | Companion needs |
+|---|---|---|
+| **full** (default) | media page, swipe up for hardware | administrator rights for temperatures and power |
+| **media** | media page only | normal rights |
+| **hardware** | hardware page only | administrator rights for temperatures and power |
+
+## Repository layout
 
 | Path | What it is |
 |---|---|
-| `firmware/NowPlaying/` | Arduino sketch. Open `NowPlaying.ino`. |
-| `firmware/NowPlaying/font_*.c` | Montserrat 14/16/22 with Latin-1, 34 px digits for temperatures, and a 48 px play/pause/music icon font |
-| `firmware/NowPlaying/scr_st77916.h`, `pincfg.h` | Vendor driver files (unchanged copies) |
-| `pc/NowPlayingBridge/` | Windows bridge (C#, .NET 8). `Hardware.cs` reads the sensors. |
-| `tools/install-autostart.ps1` | Starts the bridge at logon with administrator rights |
-| `tools/usb-check.ps1` | Tells you which USB connection your board uses |
-| `extras/lv_conf.h` | LVGL config, for reference |
+| `firmware/` | Board firmware (PlatformIO, Arduino, LVGL 8.4) |
+| `firmware/src/` | `main.cpp` (pages, loop), `link.cpp` (serial protocol), `display.cpp` (screen, brightness, PC-off mode), `media_page.cpp`, `hardware_page.cpp` |
+| `firmware/src/board/jc3636w518/` | Board support: the vendor's display driver, unmodified, plus our pin map |
+| `firmware/src/fonts/` | Montserrat with Latin-1, 34 px digits, and play/pause/music icons |
+| `firmware/include/` | `config.h` (features and timings), `protocol.h`, `lv_conf.h` |
+| `firmware/test/sim/` | Simulator: runs the firmware on Linux against fake hardware and checks it |
+| `host/` | Windows companion (C#, .NET 8): `Core/`, `Media/`, `Hardware/` |
+| `tools/` | `install-autostart.ps1` (start at logon), `usb-check.ps1` (which USB port your board has) |
+| `docs/` | [Serial protocol](docs/protocol.md), screenshots |
 
-## 1. Firmware (Arduino IDE)
+## 1. Firmware
 
-**Libraries** (exact versions matter):
-- `ESP32_Display_Panel` **0.1.4** and `ESP32_IO_Expander` **0.0.2**
-- `lvgl` **8.4.0**
-- Copy `extras/lv_conf.h` into your Arduino `libraries` folder, next to the `lvgl` folder.
+Install [PlatformIO](https://platformio.org) (the VS Code extension or the `pio` command
+line), plug the board in, and from the `firmware` folder run:
 
-**Board settings** (Tools menu):
-- Board: *ESP32S3 Dev Module*
-- Flash size: 16 MB. Partition scheme: any with an app partition of at least 3 MB.
-- PSRAM: **OPI PSRAM**. The sketch stops with a serial message if PSRAM is missing.
-- USB CDC On Boot: see the next section.
+```
+pio run -e full -t upload        # or: -e media, -e hardware
+```
 
-**Which USB port does the board have?** Plug it in and open *Device Manager → Ports (COM & LPT)*:
-- *USB Serial Device (COMx)* or *USB JTAG/serial debug unit*: the native ESP32-S3 USB. Set **USB CDC On Boot: Enabled**.
-- *USB-SERIAL CH340*, *CP210x* or similar: a USB-to-UART chip. Set **USB CDC On Boot: Disabled**.
+PlatformIO downloads the toolchain and the exact versions the board driver needs: Arduino
+core 3.3.5 through the [pioarduino](https://github.com/pioarduino/platform-espressif32)
+platform (PlatformIO's own `espressif32` platform stops at core 2.x, which the panel
+library doesn't support), LVGL 8.4.0, ESP32_Display_Panel 0.1.4 and ESP32_IO_Expander
+0.0.2. The 1.x versions of the panel library renamed their API, so don't update them.
+The build targets an ESP32-S3 with octal PSRAM. The firmware stops with a serial message
+if PSRAM is missing.
 
-The sketch uses `Serial` and works either way. Only that menu setting has to match the hardware.
+**Close DeskDial.exe before uploading.** It holds the COM port, and so does a serial
+monitor.
 
-If the compiler asks for `ESP_Panel_Conf.h` or a board header, copy it from the vendor's demo
-sketch into `firmware/NowPlaying/`.
+**Board variants.** The JC3636W518 uses the ESP32-S3's native USB port, so
+`usb-check.ps1` reports *Native ESP32-S3 USB*. If yours reports a USB-to-serial chip
+(CH340, CP210x…), build with `-DARDUINO_USB_CDC_ON_BOOT=0` in `platformio.ini`. The
+"PC is off" detection needs the native port, but everything else works either way.
 
-**Before uploading, quit NowPlayingBridge** (end it in Task Manager, or close its console if you started
-it with `--debug`). It holds the COM port, and the Arduino Serial Monitor does the same.
+**Other build systems.** The features can also be switched off in
+`firmware/include/config.h` (`DESKDIAL_MEDIA`, `DESKDIAL_HARDWARE`). `lv_conf.h` must be
+found by LVGL (`LV_CONF_INCLUDE_SIMPLE`).
 
-## 2. Windows bridge
+## 2. Windows companion
 
 Install the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0), then:
 
 ```
-cd pc\NowPlayingBridge
-dotnet publish -c Release
+cd host
+dotnet publish -c Release                            # media + hardware
+dotnet publish -c Release -p:EnableHardware=false    # media only
+dotnet publish -c Release -p:EnableMedia=false       # hardware only
 ```
 
-The program is at `pc\NowPlayingBridge\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\NowPlayingBridge.exe`.
-To run it on a PC without the SDK, install the **.NET 8 Desktop Runtime**; the bridge uses WPF to draw
-non-Latin titles.
+The program is `host\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\DeskDial.exe`.
+On a PC without the SDK, install the **.NET 8 Desktop Runtime**. The media module uses WPF
+to draw non-Latin titles.
 
-- First run: `NowPlayingBridge.exe --debug` shows port probing, track changes, commands and which
-  sensors were picked. Every 30 s it also logs a `memory:` line with the allocation rate and heap size. Run it from an **administrator** terminal to see temperatures.
-- `NowPlayingBridge.exe --trace-time` does the same as `--debug`, and also records the playback position
-  to `timeline-trace-<date>-<time>.csv` on your Desktop. It logs what the player published on every
-  timeline/playback event, each time the bridge re-read it, and every position sent to the board.
-  Only one copy of the bridge can run, so stop the autostart copy first, e.g. with
-  `Stop-ScheduledTask NowPlayingBridge` in an admin PowerShell.
-- It finds the board by probing every COM port for its handshake. Use `--port COM5` to skip probing.
-- **Which app it shows:** whatever is actually playing, whether that's Spotify, a browser tab (YouTube in Chrome,
-  Edge or Firefox) or VLC. If several play at once, it follows Windows' own media flyout. When nothing is
-  playing, it keeps showing the last paused item, so an idle Spotify in the background doesn't take over.
-  Use `--spotify-only` to show Spotify and nothing else.
+It finds the board by trying each COM port for the DeskDial handshake. Options:
+
+| Option | |
+|---|---|
+| `--port COM5` | Use this port instead of probing |
+| `--debug` | Open a console with a log: port probing, track changes, commands, sensor picks, and a `memory:` line every 30 s |
+| `--spotify-only` | Show Spotify and no other app (media) |
+| `--trace-time` | `--debug`, plus a CSV of the playback position as published and as sent, on your Desktop (media) |
+| `--list-sensors` | Print every sensor with its identifier and the automatic picks (hardware) |
+
+Only one copy runs at a time. Stop the autostart copy first, e.g. with
+`Stop-ScheduledTask DeskDial` in an admin PowerShell.
+
+**Which app it shows:** whatever is actually playing, whether that's Spotify, a browser
+tab (YouTube in Chrome, Edge or Firefox) or VLC. If several play at once, it follows
+Windows' own media flyout. When nothing is playing, it keeps showing the last paused
+item, so an idle Spotify in the background doesn't take over.
 
 ### Hardware sensors
 
 Sensors are read with [LibreHardwareMonitorLib](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
 and picked automatically, so it works on any PC. Whatever a machine doesn't expose shows as `--`.
-- **Administrator rights are required** for temperatures and power. Load, clocks and memory work
-  without them.
+
+- **Administrator rights are required** for temperatures and power. Load, clocks and
+  memory work without them.
 - **CPU and motherboard sensors also need the PawnIO driver.** Install it once from
-  [pawnio.eu](https://pawnio.eu). It replaces the old WinRing0 driver, which Windows Defender blocks.
-- `NowPlayingBridge.exe --list-sensors` (as administrator) prints every sensor with its identifier, plus the
-  automatic picks.
-- **What's picked by default:**
-  - CPU temperature from *CCD1 (Tdie)*, falling back to *CPU Package* or *Core (Tctl/Tdie)* on CPUs
-    without it.
+  [pawnio.eu](https://pawnio.eu). It replaces the old WinRing0 driver, which Windows
+  Defender blocks.
+- **Default picks:**
+  - CPU temperature from *CCD1 (Tdie)*, falling back to *CPU Package* or *Core (Tctl/Tdie)*.
   - CPU clock from *Cores (Average)*.
-  - The GPU with the most dedicated memory. This skips the integrated graphics in Ryzen and Intel CPUs,
-    which LibreHardwareMonitor lists like any other GPU.
-  - GPU load, clock and temperature from *GPU Core*, power from *GPU Package*, and memory from
-    *GPU Memory Used / Total* (GB).
-  - The bottom row shows **RAM**, the hottest module's `DIMM #n` reading whatever the slot layout, plus the
-    **SSD**.
+  - The GPU with the most dedicated memory. This skips the integrated graphics of Ryzen
+    and Intel CPUs, which LibreHardwareMonitor lists like any other GPU.
+  - GPU load, clock and temperature from *GPU Core*, power from *GPU Package*, memory from
+    *GPU Memory Used / Total*.
+  - The bottom row shows **RAM**, the hottest `DIMM #n` reading, and the **SSD**.
 - If a pick is wrong, put a `sensors.ini` next to the exe:
   ```
   # metric = sensor identifier from --list-sensors
@@ -109,62 +133,83 @@ and picked automatically, so it works on any PC. Whatever a machine doesn't expo
   temp2       = /nvme/0/temperature/0
   temp2_label = SSD
   ```
-  Keys: `cpu_temp cpu_load cpu_clock cpu_power gpu_temp gpu_load gpu_clock gpu_power vram_used vram_total`,
-  plus `gpu`, `temp1`–`temp3` and `temp1_label`–`temp3_label` (labels up to 11 characters).
+  Keys: `cpu_temp cpu_load cpu_clock cpu_power gpu_temp gpu_load gpu_clock gpu_power
+  vram_used vram_total`, plus `gpu`, `temp1`–`temp3` and `temp1_label`–`temp3_label`
+  (labels up to 11 characters).
 
-### Start at login
+### Start at logon
 
-The bridge needs administrator rights, so it starts from Task Scheduler instead of the Startup folder.
-After building, run this from an **elevated** PowerShell in the project folder:
+The hardware module needs administrator rights, so DeskDial starts from Task Scheduler
+instead of the Startup folder. After building, run this from an **elevated** PowerShell
+in the repository folder:
+
 ```
 powershell -ExecutionPolicy Bypass -File .\tools\install-autostart.ps1 -Port COM3
 ```
-This copies the program to `%LOCALAPPDATA%\Programs\NowPlayingBridge`, registers a logon task with
-the highest privileges (no UAC prompt), and starts it. Run it again after each rebuild. Use `-Remove`
-to uninstall. Put `sensors.ini` in that installed folder.
 
-## Behaviour
+This copies the program to `%LOCALAPPDATA%\Programs\DeskDial`, registers a logon task
+with the highest privileges (no UAC prompt), and starts it. Add `-NoElevation` for a
+media-only build, which doesn't need administrator rights. Run the script again after
+each rebuild, and use `-Remove` to uninstall. Put `sensors.ini` in the installed folder.
 
-- **Tap the artwork** to toggle play/pause. The UI flips immediately, and a play or pause glyph shows
-  for 700 ms the state it's moving *to*. The PC confirms the real state about 150 ms later.
-  Stale frames are ignored for 1.5 s after a tap so the UI doesn't flicker back.
-- **Prev / next** buttons sit at the left and right edges.
-- **Brightness:** hold the artwork for 5 s to open the *Brightness* dialog. The slider goes from 10 % to
-  100 % in steps of 10 and previews live. *Cancel* restores the previous level. *Save* stores it in the
-  board's flash (NVS), and it's applied at every boot (100 % until something is saved). Idle dimming
-  still drops to 10 %, and the screen returns to the saved level on wake.
-- **Idle:** shown when Spotify isn't running, when the PC program isn't connected (5 s timeout),
-  or when the track has been **paused for 120 s**. The display shows "Nothing is playing" and hides
-  the buttons. The artwork stops responding to taps. After 10 s the backlight dims to 10 %, and it
-  comes back to the saved brightness on any touch or when a track starts.
-- **PC off or asleep:** an awake PC sends a USB heartbeat every millisecond, even with no program
-  running. When it stops for 2 s, the board goes fully dark. It stops drawing the screen, slows the CPU to
-  80 MHz, and only checks the touch panel every 100 ms. A touch lights the screen for 5 s with "PC is off".
-  When the heartbeat returns, the board wakes on its own and the bridge reconnects. This needs the
-  native USB port and *USB CDC On Boot: Enabled*. If the CPU clock change ever causes trouble, set
-  `PC_OFF_CPU_MHZ` to 0 in the sketch.
-- **Pages:** swipe **up** for the hardware page, and **down** to return to the media page. The board
-  remembers the last page across restarts. The PC only reads sensors while the hardware page is showing.
-- **Hardware page** (layout v2):
-  - GPU and RAM memory run across the top as used / total with a bar.
-  - The two arcs show CPU and GPU **load** from 0 to 100 %, with their colour shifting from blue to pink as
-    they fill. Inside each arc is the temperature, with clock and power below.
-  - Labelled temperatures run along the bottom: RAM (hottest module) and SSD.
-  - Temperatures, clocks and memory amounts are coloured by value, from cool blue through violet to
-    red-pink. The ranges are 30–90 °C for CPU/GPU, 25–75 °C for RAM/SSD, 1–5.5 GHz for CPU, 0.2–3 GHz for
-    GPU, and the fill fraction for memory. They're the `SCALE_*` constants at the top of the sketch. It's never dimmed for idle, and values switch to `--`
-  if no data arrives for 3 s. The "PC is off" dark mode applies to both pages. The brightness long-press
-  is on the media page only.
-- **Titles in any language:** Latin text is drawn by the board in Montserrat. When a title or artist
-  contains characters the board has no font for (Chinese, Japanese, Korean, Arabic, Hebrew, Thai, Cyrillic,
-  emoji…), the PC renders that line with Windows' fonts and sends it as a small image. Right-to-left text and
-  Arabic letter joining come out correctly, and long titles still scroll.
+## Using it
 
-  ![Japanese, Korean and Arabic titles](docs/other-scripts.png)
+- **Tap the artwork** to play or pause. The screen responds at once and shows the state
+  it's moving to for 700 ms. The PC confirms the real state about 150 ms later.
+- **Previous / next** buttons sit at the left and right edges.
+- **Brightness:** hold the artwork (or anywhere on the hardware page) for 5 s. The slider
+  goes from 10 % to 100 % in steps of 10 and previews live. *Save* keeps it across
+  restarts; *Cancel* restores the previous level.
+- **Idle:** when nothing plays, the PC companion isn't running, or a track has been
+  paused for 2 minutes, the media page shows "Nothing is playing" and dims to 10 % after
+  10 s. Any touch, or a track starting, brings it back.
+- **Pages:** swipe up for the hardware page and down to return. The board remembers the
+  last page. The PC only reads sensors while the hardware page is showing, and that page
+  never dims.
+- **Hardware page:** GPU memory and RAM across the top, CPU and GPU load arcs with the
+  temperature inside and clock and power below, and labelled temperatures along the
+  bottom. Values are coloured from cool blue through violet to red-pink. The ranges are
+  the `SCALE_*` constants in `hardware_page.cpp`. Values switch to `--` if no data
+  arrives for 3 s.
+- **PC off or asleep:** an awake PC sends a USB heartbeat every millisecond, even with no
+  program running. When it stops for 2 s, the board goes dark. It stops drawing, slows
+  its CPU to 80 MHz and checks the touch panel every 100 ms. A touch shows "PC is off"
+  for 5 s. When the heartbeat returns, the board wakes on its own and the companion
+  reconnects. If the CPU clock change ever causes trouble, set `PC_OFF_CPU_MHZ` to 0 in
+  `config.h`.
+- **Playback speed:** the elapsed time counts at the speed the player reports (e.g. 1.5×
+  on YouTube) and re-syncs whenever the speed, play/pause or the position changes.
+- **Titles in any language:** Latin text is drawn by the board in Montserrat. When a
+  title or artist contains characters the board has no font for (Chinese, Japanese,
+  Korean, Arabic, Hebrew, Thai, Cyrillic, emoji…), the PC renders that line with
+  Windows' fonts and sends it as a small image. Right-to-left text and Arabic letter
+  joining come out correctly, and long titles still scroll.
 
-## Serial protocol
+  <img src="docs/other-scripts.png" width="560" alt="Japanese, Korean and Arabic titles">
 
-Frames in both directions: `A5 5A | type u8 | length u32 LE | payload | checksum u8`.
-The full definition is in `firmware/NowPlaying/protocol.h`. Hardware readings are sent as `(metric id,
-float)` pairs, so adding a metric later doesn't break older firmware. Artwork is sent pre-scaled as 150×150 RGB565
-(45 KB, byte-swapped for `LV_COLOR_16_SWAP=1`), so the ESP32 never decodes a JPEG.
+## Simulator tests
+
+`firmware/test/sim` compiles the real firmware sources for Linux, with fake hardware in
+place of the panel, touch, USB and flash. The test plays the PC's side of the protocol
+and checks how the board responds: taps, commands, dimming, the brightness dialog, PC
+off, swipes, feature negotiation, text images and playback speed. It runs once for each
+build (full, media, hardware).
+
+```
+make -C firmware/test/sim          # needs gcc, make and git (LVGL is cloned on first use)
+make -C firmware/test/sim render   # also writes PNG screenshots to build/screens/
+```
+
+The GitHub Actions workflow runs these tests and builds every firmware and companion
+variant on each push.
+
+## Protocol
+
+Frames in both directions are `A5 5A | type | length u32 | payload | checksum`. A
+handshake exchanges the features each side was built with. See
+[docs/protocol.md](docs/protocol.md).
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). The board vendor's display driver and the fonts keep their
+own licences; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

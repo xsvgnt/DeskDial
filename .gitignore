@@ -1,15 +1,33 @@
+# Logs: may contain personal information (user names, paths, device ids)
+*.log
+inols*
+timeline-trace-*.csv
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Firmware simulator
+firmware/test/sim/build/
+firmware/test/sim/.lvgl/
+
 # .NET build output
 bin/
 obj/
+publish/
 *.exe
 *.dll
 *.pdb
+*.user
+
+# Local settings
+sensors.ini
 
 # IDE / OS
 .vs/
 .vscode/
+.idea/
 Thumbs.db
 desktop.ini
-
-# Arduino build output
-build/
+.DS_Store

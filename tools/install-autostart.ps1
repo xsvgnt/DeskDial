@@ -1,24 +1,31 @@
-# Starts NowPlayingBridge at logon with administrator rights (needed for
-# temperatures, fans and power), without a UAC prompt each time.
+# Starts DeskDial at every logon.
 #
-# From an elevated PowerShell ("Run as administrator"), in the project folder:
+# The hardware module needs administrator rights for temperatures and power,
+# so by default DeskDial runs from Task Scheduler with the highest privileges
+# (no UAC prompt each time). A media-only build doesn't need them: pass
+# -NoElevation to run it with normal rights.
+#
+# From an elevated PowerShell ("Run as administrator"), in the repository folder:
 #   powershell -ExecutionPolicy Bypass -File .\tools\install-autostart.ps1
 #   powershell -ExecutionPolicy Bypass -File .\tools\install-autostart.ps1 -Port COM3
+#   powershell -ExecutionPolicy Bypass -File .\tools\install-autostart.ps1 -NoElevation
 #   powershell -ExecutionPolicy Bypass -File .\tools\install-autostart.ps1 -Remove
 #
-# The published program is copied to %LOCALAPPDATA%\Programs\NowPlayingBridge,
-# so rebuilding in the project folder never fights with the running copy.
-# Run the script again after each rebuild to update the installed copy.
+# The published program is copied to %LOCALAPPDATA%\Programs\DeskDial, so
+# rebuilding never fights with the running copy. Run the script again after
+# each rebuild to update the installed copy.
+# SPDX-License-Identifier: MIT
 
 param(
-    [string]$Source = (Join-Path $PSScriptRoot '..\pc\NowPlayingBridge\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish'),
+    [string]$Source = (Join-Path $PSScriptRoot '..\host\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish'),
     [string]$Port = '',
+    [switch]$NoElevation,
     [switch]$Remove
 )
 
 $ErrorActionPreference = 'Stop'
-$TaskName = 'NowPlayingBridge'
-$Target = Join-Path $env:LOCALAPPDATA 'Programs\NowPlayingBridge'
+$TaskName = 'DeskDial'
+$Target = Join-Path $env:LOCALAPPDATA 'Programs\DeskDial'
 
 $me = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -28,7 +35,7 @@ if (-not ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal
 
 # Stop a running copy before replacing or removing it
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-Get-Process NowPlayingBridge -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process DeskDial -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 
 if ($Remove) {
@@ -37,29 +44,33 @@ if ($Remove) {
     exit 0
 }
 
-if (-not (Test-Path (Join-Path $Source 'NowPlayingBridge.exe'))) {
-    Write-Host "NowPlayingBridge.exe not found in $Source" -ForegroundColor Yellow
-    Write-Host 'Build it first:  cd pc\NowPlayingBridge ;  dotnet publish -c Release'
+if (-not (Test-Path (Join-Path $Source 'DeskDial.exe'))) {
+    Write-Host "DeskDial.exe not found in $Source" -ForegroundColor Yellow
+    Write-Host 'Build it first:  cd host ;  dotnet publish -c Release'
     exit 1
 }
 
 New-Item -ItemType Directory -Force -Path $Target | Out-Null
 Copy-Item -Path (Join-Path $Source '*') -Destination $Target -Recurse -Force
-$exe = Join-Path $Target 'NowPlayingBridge.exe'
+$exe = Join-Path $Target 'DeskDial.exe'
 
 $actionArgs = @{ Execute = $exe; WorkingDirectory = $Target }
 if ($Port) { $actionArgs.Argument = "--port $Port" }
 $action = New-ScheduledTaskAction @actionArgs
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $me.Name
-$principal = New-ScheduledTaskPrincipal -UserId $me.Name -LogonType Interactive -RunLevel Highest
+$runLevel = if ($NoElevation) { 'Limited' } else { 'Highest' }
+$principal = New-ScheduledTaskPrincipal -UserId $me.Name -LogonType Interactive -RunLevel $runLevel
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
-    -Settings $settings -Description 'Feeds the ESP32 now-playing / hardware display over USB.' -Force | Out-Null
+    -Settings $settings -Description 'DeskDial: feeds the round display over USB (now playing, hardware stats).' -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 
 Write-Host "Installed to $Target and started." -ForegroundColor Green
-Write-Host 'It will start automatically at every logon, with administrator rights.'
-Write-Host 'If you added a shortcut to the Startup folder earlier, delete it.'
+if ($NoElevation) {
+    Write-Host 'It will start automatically at every logon, with normal rights.'
+} else {
+    Write-Host 'It will start automatically at every logon, with administrator rights.'
+}

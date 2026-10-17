@@ -1,0 +1,73 @@
+# Builds every variant of the firmware and of the Windows companion, and runs
+# the firmware simulator tests.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  simulator:
+    name: Firmware simulator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run (full, media, hardware)
+        run: make -C firmware/test/sim -j4 render
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simulator-screens
+          path: firmware/test/sim/build/screens/**/*.png
+
+  firmware:
+    name: Firmware (${{ matrix.env }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [full, media, hardware]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ hashFiles('firmware/platformio.ini') }}
+      - run: pip install platformio
+      - name: Build
+        run: pio run -d firmware -e ${{ matrix.env }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: firmware/.pio/build/${{ matrix.env }}/firmware.bin
+
+  companion:
+    name: Windows companion (${{ matrix.name }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: full
+            props: ""
+          - name: media
+            props: "-p:EnableHardware=false"
+          - name: hardware
+            props: "-p:EnableMedia=false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Publish
+        run: dotnet publish host/DeskDial.csproj -c Release ${{ matrix.props }} -o publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeskDial-${{ matrix.name }}
+          path: publish/

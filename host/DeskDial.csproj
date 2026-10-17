@@ -1,0 +1,67 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    DeskDial companion for Windows.
+
+      dotnet publish -c Release                          media + hardware (default)
+      dotnet publish -c Release -p:EnableHardware=false  media only: no admin rights, no sensor library
+      dotnet publish -c Release -p:EnableMedia=false     hardware only: no WPF
+
+    Output: bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\DeskDial.exe
+    SPDX-License-Identifier: MIT
+  -->
+
+  <PropertyGroup>
+    <EnableMedia Condition="'$(EnableMedia)' == ''">true</EnableMedia>
+    <EnableHardware Condition="'$(EnableHardware)' == ''">true</EnableHardware>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- WinExe: no console window. Pass the debug flag to get one with logs. -->
+    <OutputType>WinExe</OutputType>
+    <!-- 10.0.19041: Windows' media session API (GlobalSystemMediaTransportControls) -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DeskDial</AssemblyName>
+    <RootNamespace>DeskDial</RootNamespace>
+    <Version>1.0.0</Version>
+    <Product>DeskDial</Product>
+    <Description>Feeds the DeskDial round display over USB: now playing and hardware stats.</Description>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+  </PropertyGroup>
+
+  <!-- Media: Windows media controls, artwork, PC-rendered titles (WPF text engine) -->
+  <PropertyGroup Condition="'$(EnableMedia)' == 'true'">
+    <UseWPF>true</UseWPF>
+    <DefineConstants>$(DefineConstants);MEDIA</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(EnableMedia)' != 'true'">
+    <Compile Remove="Media\**" />
+  </ItemGroup>
+
+  <!-- Hardware: sensors through LibreHardwareMonitorLib -->
+  <PropertyGroup Condition="'$(EnableHardware)' == 'true'">
+    <DefineConstants>$(DefineConstants);HARDWARE</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(EnableHardware)' == 'true'">
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(EnableHardware)' != 'true'">
+    <Compile Remove="Hardware\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 10.0.3: LibreHardwareMonitorLib 0.9.6 requires at least this version -->
+    <PackageReference Include="System.IO.Ports" Version="10.0.3" />
+  </ItemGroup>
+
+  <Target Name="DeskDialCheckFeatures" BeforeTargets="BeforeBuild"
+          Condition="'$(EnableMedia)' != 'true' And '$(EnableHardware)' != 'true'">
+    <Error Text="Enable at least one of EnableMedia and EnableHardware." />
+  </Target>
+
+</Project>
