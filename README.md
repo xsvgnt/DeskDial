@@ -1,6 +1,6 @@
 # DeskDial
 
-A round desk display for your PC. DeskDial shows what Windows is playing, with the
+A round desk display for your PC developed with Claude AI (Opus 5.5). DeskDial shows what Windows is playing, with the
 artwork and play/pause, next and previous controls. Swipe up for a second page with
 your PC's loads, temperatures, clocks, power and memory. It runs on the JC3636W518
 board (ESP32-S3 with a 360×360 round touch screen), and a small Windows companion
@@ -9,13 +9,13 @@ no Home Assistant.
 
 ```
 Spotify, browsers, VLC… ─► Windows media controls ─┐
-                                                   ├─► DeskDial.exe ══USB══► board
-CPU / GPU / RAM / SSD sensors ─────────────────────┘ ◄── play/pause, next, prev
+                                                   ├─► DeskDial.exe ══USB══► board ◄── play/pause, next, prev
+CPU / GPU / RAM / SSD sensors ─────────────────────┘ 
 ```
 
 <p>
-<img src="docs/ui-preview.png" width="280" alt="Now playing page">
-<img src="docs/hardware-page.png" width="280" alt="Hardware page">
+<img src="docs/ui-preview.png" height="200" alt="Now playing page">
+<img src="docs/hardware-page.png" height="200" alt="Hardware page">
 </p>
 
 Both halves are modular. Build the media page, the hardware page, or both. A board and
@@ -26,6 +26,31 @@ a companion built with different modules agree on what they have in common.
 | **full** (default) | media page, swipe up for hardware | administrator rights for temperatures and power |
 | **media** | media page only | normal rights |
 | **hardware** | hardware page only | administrator rights for temperatures and power |
+
+## Device used
+Bought on Aliexpress for ~30$
+
+[1.8-Inch Round Screen QSPI 360 * 360 IPS Display ESP32-S3 8M PSRAM 16M FLASH Secondary Screen AIDA64 Pickup Spectrum Electronic](https://aliexpress.com/item/1005007606734344.html)
+
+<p>
+<img src="docs/device.jpg" width="200" alt="Device ">
+</p>
+
+| Name | Description |
+|---|---|
+| Display color | RGB 262K color |
+| SKU | JC3636W518C_I_Y |
+| Size | 1.8 inch |
+| Type | TFT |
+| Driver chip | ST77916 CST816（touch） |
+| Resolution | 360 * 360(Pixel) |
+| Effective display area | 45.68 * 45.68(mm) |
+| View | IPS |
+| Operating temperature | -20℃~70℃ |
+| Storage temperature | -30℃~80℃ |
+| Operating Voltage | 5V |
+| Power consumption | About 180mA |
+| Product weight | About 50g |
 
 ## Repository layout
 
