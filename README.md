@@ -66,6 +66,11 @@ non-Latin titles.
 
 - First run: `NowPlayingBridge.exe --debug` shows port probing, track changes, commands and which
   sensors were picked. Every 30 s it also logs a `memory:` line with the allocation rate and heap size. Run it from an **administrator** terminal to see temperatures.
+- `NowPlayingBridge.exe --trace-time` does the same as `--debug`, and also records the playback position
+  to `timeline-trace-<date>-<time>.csv` on your Desktop. It logs what the player published on every
+  timeline/playback event, each time the bridge re-read it, and every position sent to the board.
+  Only one copy of the bridge can run, so stop the autostart copy first, e.g. with
+  `Stop-ScheduledTask NowPlayingBridge` in an admin PowerShell.
 - It finds the board by probing every COM port for its handshake. Use `--port COM5` to skip probing.
 - **Which app it shows:** whatever is actually playing, whether that's Spotify, a browser tab (YouTube in Chrome,
   Edge or Firefox) or VLC. If several play at once, it follows Windows' own media flyout. When nothing is

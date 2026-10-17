@@ -10,6 +10,7 @@
 //
 // Usage: NowPlayingBridge.exe [--port COM5] [--spotify-only] [--debug]
 //        NowPlayingBridge.exe --list-sensors
+//        NowPlayingBridge.exe --trace-time   (debug log + position trace CSV)
 
 using System.IO; // not implicit in WPF projects
 using System.IO.Ports;
@@ -54,6 +55,11 @@ static class Program
                 case "--port" when i + 1 < args.Length: port = args[++i]; break;
                 case "--spotify-only": spotifyOnly = true; break;
                 case "--list-sensors": listSensors = true; break;
+                case "--trace-time":
+                    OpenConsole();
+                    Log.Enabled = true;
+                    Log.Write($"Tracing the playback position to {TimeTrace.Start()}");
+                    break;
             }
         }
 
@@ -269,10 +275,19 @@ sealed class Bridge
     Link? _link;
     volatile bool _needFull = true;
 
-    string _artKey = "";
+    // Artwork. Browsers publish a new song's title first and its artwork later
+    // (after downloading it), so for a moment Windows reports the new title
+    // with the previous cover. Every thumbnail update is therefore decoded
+    // again, compared by fingerprint, and re-checked shortly after each track
+    // change in case the real artwork arrives without a separate event.
+    string _trackKey = "";               // title/artist/album currently shown
     uint _artId;
-    byte[]? _artPixels;
-    int _artAttempts;
+    byte[]? _artPixels;                  // null = placeholder
+    ulong _artFingerprint;               // of _artPixels, 0 = placeholder
+    bool _artDirty;                      // thumbnail may have changed: decode again
+    bool _artForTrack;                   // an image was loaded for the current track
+    readonly List<DateTime> _artRechecks = new();
+    static readonly TimeSpan[] ArtRecheckDelays = { TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3) };
     uint _sentArtId = uint.MaxValue;
     readonly string?[] _sentTextImg = new string?[2]; // per field: text sent as image, "" = label
     readonly string?[] _textSeen = new string?[2];    // per field: last text checked for images
@@ -285,11 +300,18 @@ sealed class Bridge
     volatile bool _mediaDirty = true, _playbackDirty = true, _timelineDirty = true;
     readonly List<Session> _watched = new();
     DateTime _nextSafetyRefresh;
-    string _title = "", _artist = "", _album = "", _mediaKey = "";
+    string _title = "", _artist = "", _album = "", _mediaKey = ""; // _mediaKey: title/artist/album
     IRandomAccessStreamReference? _thumb;
     PlaybackStatus _status = PlaybackStatus.Closed;
     TimeSpan _tlStart, _tlEnd, _tlPos;
     DateTimeOffset _tlUpdated;
+    // Firefox sometimes publishes an empty timeline (position 0, duration 0)
+    // in the middle of a video that keeps playing, and only publishes a real
+    // one again on the next pause/seek. While the same track is loaded, the
+    // last valid timeline is kept and projected forward instead.
+    bool _tlHasGood;                     // a valid timeline was seen for _tlGoodTrack
+    string _tlGoodTrack = "";
+    bool _tlHeld;                        // currently projecting a kept timeline
     string? _stTitle, _stArtist;          // BuildState cache
     byte[] _stTitleBytes = Array.Empty<byte>(), _stArtistBytes = Array.Empty<byte>();
     long _hwAllocated;                    // bytes allocated by sensor reads (debug stats)
@@ -520,6 +542,11 @@ sealed class Bridge
             _nextSafetyRefresh = DateTime.UtcNow.AddSeconds(15);
             _watchDirty = _selectDirty = _mediaDirty = _playbackDirty = _timelineDirty = true;
         }
+        if (_artRechecks.Count > 0 && DateTime.UtcNow >= _artRechecks[0])
+        {
+            _artRechecks.RemoveAt(0);
+            _mediaDirty = true; // look for artwork that arrived without an event
+        }
         if (_watchDirty) { _watchDirty = false; WatchAllSessions(); }
         if (_selectDirty) { _selectDirty = false; await SelectSessionAsync(); }
 
@@ -527,9 +554,11 @@ sealed class Bridge
         if (s is null)
         {
             _title = _artist = _album = _mediaKey = "";
+            _artDirty = true;
             _thumb = null;
             _status = PlaybackStatus.Closed;
             _tlStart = _tlEnd = _tlPos = TimeSpan.Zero;
+            _tlHasGood = _tlHeld = false;
             return;
         }
         try
@@ -545,21 +574,56 @@ sealed class Bridge
                 if (_artist.Length == 0) _artist = props?.AlbumArtist ?? "";
                 _album = props?.AlbumTitle ?? "";
                 _thumb = props?.Thumbnail;
-                _mediaKey = $"{_title}\u0001{_artist}\u0001{_album}\u0001{_thumb is not null}";
+                _mediaKey = $"{_title}\u0001{_artist}\u0001{_album}";
+                if (_mediaKey != _tlGoodTrack)
+                {
+                    // Another track: a kept timeline belongs to the previous one
+                    _tlHasGood = false;
+                    if (_tlHeld)
+                    {
+                        _tlHeld = false;
+                        _tlStart = _tlEnd = _tlPos = TimeSpan.Zero;
+                    }
+                }
+                _artDirty = true; // the thumbnail may have changed even if the title didn't
             }
             if (_playbackDirty)
             {
                 _playbackDirty = false;
-                _status = StatusOf(s);
+                var status = StatusOf(s);
+                // A kept timeline is projected from its own anchor: re-anchor it
+                // when play/pause changes so the count stops or resumes in place.
+                if (_tlHeld && status != _status) RebaseTimeline();
+                _status = status;
             }
             if (_timelineDirty)
             {
                 _timelineDirty = false;
                 var tl = s.GetTimelineProperties();
-                _tlStart = tl?.StartTime ?? TimeSpan.Zero;
-                _tlEnd = tl?.EndTime ?? TimeSpan.Zero;
-                _tlPos = tl?.Position ?? TimeSpan.Zero;
-                _tlUpdated = tl?.LastUpdatedTime ?? default;
+                var start = tl?.StartTime ?? TimeSpan.Zero;
+                var end = tl?.EndTime ?? TimeSpan.Zero;
+                bool valid = end - start > TimeSpan.Zero;
+                if (!valid && _tlHasGood && _tlGoodTrack == _mediaKey)
+                {
+                    if (!_tlHeld)
+                        Log.Write("timeline: the player cleared it mid-track, counting on from the last valid one");
+                    RebaseTimeline();
+                    _tlHeld = true;
+                }
+                else
+                {
+                    _tlStart = start;
+                    _tlEnd = end;
+                    _tlPos = tl?.Position ?? TimeSpan.Zero;
+                    _tlUpdated = tl?.LastUpdatedTime ?? default;
+                    _tlHeld = false;
+                    if (valid)
+                    {
+                        _tlHasGood = true;
+                        _tlGoodTrack = _mediaKey;
+                    }
+                }
+                TimeTrace.Snapshot("read", s);
             }
         }
         catch (Exception e)
@@ -635,8 +699,19 @@ sealed class Bridge
 
     // The shown app's own events: mark exactly what to re-read.
     void OnMediaChanged(Session s, MediaPropertiesChangedEventArgs a) { _mediaDirty = true; Wake(); }
-    void OnPlaybackChanged(Session s, PlaybackInfoChangedEventArgs a) { _playbackDirty = _timelineDirty = true; Wake(); }
-    void OnTimelineChanged(Session s, TimelinePropertiesChangedEventArgs a) { _timelineDirty = true; Wake(); }
+    void OnPlaybackChanged(Session s, PlaybackInfoChangedEventArgs a)
+    {
+        TimeTrace.Snapshot("playback-event", s);
+        _playbackDirty = _timelineDirty = true;
+        Wake();
+    }
+
+    void OnTimelineChanged(Session s, TimelinePropertiesChangedEventArgs a)
+    {
+        TimeTrace.Snapshot("timeline-event", s);
+        _timelineDirty = true;
+        Wake();
+    }
 
     // ---------------------------------------------------------------- push --
     /// Sends the cached state. No WinRT calls here except loading new artwork.
@@ -655,36 +730,12 @@ sealed class Bridge
         var dur = _tlEnd - _tlStart;
         if (has && dur > TimeSpan.Zero)
         {
-            var pos = _tlPos - _tlStart;
-            // Players report the position only on play/pause/seek: extrapolate.
-            if (playing && _tlUpdated.Year > 2000)
-            {
-                var age = DateTimeOffset.Now - _tlUpdated;
-                if (age > TimeSpan.Zero && age < TimeSpan.FromHours(12)) pos += age;
-            }
-            if (pos < TimeSpan.Zero) pos = TimeSpan.Zero;
-            if (pos > dur) pos = dur;
+            var pos = ProjectedPosition();
             durMs = (uint)Math.Min(dur.TotalMilliseconds, uint.MaxValue);
             posMs = (uint)Math.Min(pos.TotalMilliseconds, uint.MaxValue);
         }
 
-        // Artwork: reload when the track changes; retry a couple of times because
-        // the thumbnail often lands a moment after the title.
-        string key = has ? _mediaKey : "";
-        if (key != _artKey)
-        {
-            _artKey = key;
-            _artPixels = null;
-            _artAttempts = 0;
-            _artId++;
-            Log.Write(has ? $"track: {artist} - {title}" : "track: (none)");
-        }
-        if (has && thumb is not null && _artPixels is null && _artAttempts < 3)
-        {
-            _artAttempts++;
-            _artPixels = await LoadArtAsync(thumb);
-            if (_artPixels is not null) _artId++; // new id forces a send
-        }
+        await UpdateArtAsync(has, title, artist, thumb);
 
         bool full = _needFull;
         _needFull = false;
@@ -711,6 +762,83 @@ sealed class Bridge
         await SendTextImageAsync(link, 1, has ? artist : "", full);
 
         link.Send(Proto.State, BuildState(has, playing, posMs, durMs, _artId, title, artist));
+        TimeTrace.Sent(_sessionId, posMs, durMs, has && playing);
+    }
+
+    /// Position within the track from the cached timeline. Players report it
+    /// only on play/pause/seek, so it is projected forward while playing.
+    TimeSpan ProjectedPosition()
+    {
+        var dur = _tlEnd - _tlStart;
+        var pos = _tlPos - _tlStart;
+        if (_status == PlaybackStatus.Playing && _tlUpdated.Year > 2000)
+        {
+            var age = DateTimeOffset.Now - _tlUpdated;
+            if (age > TimeSpan.Zero && age < TimeSpan.FromHours(12)) pos += age;
+        }
+        if (pos < TimeSpan.Zero) pos = TimeSpan.Zero;
+        if (dur > TimeSpan.Zero && pos > dur) pos = dur;
+        return pos;
+    }
+
+    /// Re-anchors the cached timeline at the current projected position.
+    void RebaseTimeline()
+    {
+        _tlPos = _tlStart + ProjectedPosition();
+        _tlUpdated = DateTimeOffset.Now;
+    }
+
+    async Task UpdateArtAsync(bool has, string title, string artist, IRandomAccessStreamReference? thumb)
+    {
+        string trackKey = has ? _mediaKey : "";
+        if (trackKey != _trackKey)
+        {
+            _trackKey = trackKey;
+            _artDirty = true;
+            _artForTrack = false;
+            _artRechecks.Clear();
+            if (has)
+                foreach (var d in ArtRecheckDelays) _artRechecks.Add(DateTime.UtcNow + d);
+            Log.Write(has ? $"track: {artist} - {title}" : "track: (none)");
+        }
+        if (!_artDirty) return;
+        _artDirty = false;
+
+        var px = has && thumb is not null ? await LoadArtAsync(thumb) : null;
+        if (px is not null)
+        {
+            ulong fp = Fingerprint(px);
+            bool same = fp == _artFingerprint;
+            if (!same || !_artForTrack) // skip the 15 s safety re-reads that change nothing
+                Log.Write($"artwork: {fp >> 48:X4} for \"{title}\"{(same ? " (same image as before)" : "")}");
+            if (!same)
+            {
+                _artPixels = px;
+                _artFingerprint = fp;
+                _artId++; // new id: PushAsync sends it
+            }
+            _artForTrack = true;
+        }
+        else if (!has || thumb is null || !_artForTrack)
+        {
+            // No artwork, or it failed to load for a new track: show the
+            // placeholder rather than the previous song's cover. A recheck
+            // will pick it up if it arrives later.
+            if (_artPixels is not null)
+            {
+                _artPixels = null;
+                _artFingerprint = 0;
+                _artId++;
+            }
+        }
+    }
+
+    /// FNV-1a over the converted pixels: identical images give identical values.
+    static ulong Fingerprint(byte[] data)
+    {
+        ulong h = 14695981039346656037;
+        foreach (byte b in data) { h ^= b; h *= 1099511628211; }
+        return h == 0 ? 1 : h; // 0 is reserved for "placeholder"
     }
 
     async Task SendTextImageAsync(Link link, byte field, string text, bool full)
